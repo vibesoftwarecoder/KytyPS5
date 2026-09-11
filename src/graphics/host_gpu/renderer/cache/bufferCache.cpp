@@ -13,11 +13,13 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -30,13 +32,34 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 // Local instrumentation: every download flush drains the whole GPU queue before copying back.
 struct ReadbackStats {
-	uint64_t                              drains  = 0;
-	uint64_t                              bytes   = 0;
-	double                                wait_ms = 0.0;
-	std::chrono::steady_clock::time_point since   = std::chrono::steady_clock::now();
+	uint64_t                               drains       = 0;
+	uint64_t                               bytes        = 0;
+	double                                 wait_ms      = 0.0;
+	uint64_t                               window_calls = 0;
+	std::unordered_map<uint64_t, uint32_t> window_drains; // window start -> drains
+	std::chrono::steady_clock::time_point  since = std::chrono::steady_clock::now();
 };
 
 ReadbackStats g_readback_stats;
+
+// Where readbacks come from: the GPU thread itself (per-draw resource evaluation and other
+// emulator work), guest threads touching GPU-written memory, or write faults on such memory.
+std::atomic<uint64_t> g_reads_gpu_thread {0};
+std::atomic<uint64_t> g_reads_guest {0};
+std::atomic<uint64_t> g_write_invalidations {0};
+
+void CountReadOrigin(bool gpu_thread, bool is_write) {
+	auto& counter = is_write ? g_write_invalidations : gpu_thread ? g_reads_gpu_thread : g_reads_guest;
+	counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountWindow(uint64_t window_begin, bool drained) {
+	auto& stats = g_readback_stats;
+	stats.window_calls++;
+	if (drained) {
+		stats.window_drains[window_begin]++;
+	}
+}
 
 void CountReadback(uint64_t bytes, std::chrono::steady_clock::duration wait) {
 	auto& stats = g_readback_stats;
@@ -50,6 +73,20 @@ void CountReadback(uint64_t bytes, std::chrono::steady_clock::duration wait) {
 		std::printf("Readback: %.1f GPU drains/s, %.0f ms/s waiting, %.2f MiB/s downloaded\n",
 		            static_cast<double>(stats.drains) / seconds, stats.wait_ms / seconds,
 		            static_cast<double>(stats.bytes) / seconds / static_cast<double>(MiB));
+		std::vector<std::pair<uint64_t, uint32_t>> top(stats.window_drains.begin(),
+		                                               stats.window_drains.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::printf("Readback sources: %.0f/s GPU thread, %.0f/s guest threads, %.0f/s write "
+		            "faults; %.0f window checks/s, %zu distinct windows drained; top:",
+		            static_cast<double>(g_reads_gpu_thread.exchange(0)) / seconds,
+		            static_cast<double>(g_reads_guest.exchange(0)) / seconds,
+		            static_cast<double>(g_write_invalidations.exchange(0)) / seconds,
+		            static_cast<double>(stats.window_calls) / seconds, top.size());
+		for (size_t i = 0; i < std::min<size_t>(3, top.size()); i++) {
+			std::printf(" 0x%" PRIx64 "=%u", top[i].first, top[i].second);
+		}
+		std::printf("\n");
 		std::fflush(stdout);
 		stats = {};
 	}
@@ -278,6 +315,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	CountReadOrigin(GuestGpu::IsGpuThread(), is_write);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -313,6 +351,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 			        {&buffer, buffer.Offset(range.address), range.address, range.size});
 		    });
 	    });
+	CountWindow(window_begin, !copies.empty());
 	if (!copies.empty()) {
 		DownloadBufferMemory(copies);
 		// The enumeration covered whole dirty pages and every exact interval on them.

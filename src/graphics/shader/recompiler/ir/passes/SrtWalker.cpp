@@ -579,8 +579,10 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
+			// A draw evaluates a few dozen values; reserving for every value in the program made
+			// each draw allocate, clear and free tables sized for the whole shader.
+			m_cache.reserve(INITIAL_CACHE_SIZE);
+			m_visiting.reserve(INITIAL_CACHE_SIZE);
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
@@ -1064,6 +1066,8 @@ private:
 		}
 		return false;
 	}
+
+	static constexpr size_t INITIAL_CACHE_SIZE = 64;
 
 	const ResourcePlan&                       m_program;
 	const SrtRuntime&                         m_runtime;
