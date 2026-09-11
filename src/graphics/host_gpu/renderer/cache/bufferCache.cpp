@@ -93,7 +93,15 @@ void CountReadback(uint64_t bytes, std::chrono::steady_clock::duration wait) {
 }
 
 // Local instrumentation: how each download was served. Only Served avoids a drain.
-enum class RetiredOutcome : uint8_t { Served, CurrentBatch, InFlight, Untracked, TooLarge, Count };
+enum class RetiredOutcome : uint8_t {
+	Served,
+	Unstamped,
+	CurrentBatch,
+	InFlight,
+	Untracked,
+	TooLarge,
+	Count
+};
 
 void CountRetired(RetiredOutcome outcome, std::chrono::steady_clock::duration took = {}) {
 	static uint64_t counts[static_cast<size_t>(RetiredOutcome::Count)] {};
@@ -108,11 +116,12 @@ void CountRetired(RetiredOutcome outcome, std::chrono::steady_clock::duration to
 			return static_cast<double>(counts[static_cast<size_t>(which)]) / seconds;
 		};
 		std::printf("Retired readback: %.0f/s copied without a drain (%.0f ms/s) | still drained: "
-		            "%.0f/s written in the current batch, %.0f/s in flight, %.0f/s untracked, "
-		            "%.0f/s too large\n",
+		            "%.0f/s not yet recorded, %.0f/s written in the current batch, %.0f/s in "
+		            "flight, %.0f/s untracked, %.0f/s too large\n",
 		            rate(RetiredOutcome::Served), served_ms / seconds,
-		            rate(RetiredOutcome::CurrentBatch), rate(RetiredOutcome::InFlight),
-		            rate(RetiredOutcome::Untracked), rate(RetiredOutcome::TooLarge));
+		            rate(RetiredOutcome::Unstamped), rate(RetiredOutcome::CurrentBatch),
+		            rate(RetiredOutcome::InFlight), rate(RetiredOutcome::Untracked),
+		            rate(RetiredOutcome::TooLarge));
 		std::fflush(stdout);
 		std::fill(std::begin(counts), std::end(counts), uint64_t {0});
 		served_ms = 0.0;
@@ -295,10 +304,32 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 }
 
-void BufferCache::RecordGpuWrite(uint64_t vaddr, uint64_t size) {
+void BufferCache::StampPendingWrites() {
+	if (m_unstamped_writes.empty()) {
+		return;
+	}
+	// The commands behind these writes are recorded in this batch or an earlier one, so its tick
+	// is never too early. An unstamped interval joined to a neighbour belongs to a pending write
+	// as well, so stamping whole intervals is equally safe.
+	const auto tick = m_scheduler.CurrentTick();
+	for (const auto& [vaddr, size]: m_unstamped_writes) {
+		const auto end = vaddr + size;
+		auto       it  = m_gpu_write_ticks.upper_bound(vaddr);
+		if (it != m_gpu_write_ticks.begin() && std::prev(it)->second.first > vaddr) {
+			--it;
+		}
+		for (; it != m_gpu_write_ticks.end() && it->first < end; ++it) {
+			if (it->second.second == UnstampedTick) {
+				it->second.second = tick;
+			}
+		}
+	}
+	m_unstamped_writes.clear();
+}
+
+void BufferCache::RecordGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
 	ForgetGpuWrite(vaddr, size);
-	const auto tick  = m_scheduler.CurrentTick();
-	auto       begin = vaddr;
+	auto begin = vaddr;
 	auto       end   = vaddr + size;
 	// Join neighbours written by the same batch, so draws rewriting adjacent ranges keep the map
 	// as small as the dirty set.
@@ -386,6 +417,10 @@ bool BufferCache::TryDownloadRetired(std::span<const DownloadCopy> copies) {
 	}
 	if (packed_size > m_readback_buffer.Size()) {
 		CountRetired(RetiredOutcome::TooLarge);
+		return false;
+	}
+	if (write_tick == UnstampedTick) {
+		CountRetired(RetiredOutcome::Unstamped);
 		return false;
 	}
 	if (write_tick >= m_scheduler.CurrentTick()) {
@@ -791,7 +826,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
-		RecordGpuWrite(vaddr, size);
+		RecordGpuWrite(vaddr, size, UnstampedTick);
+		m_unstamped_writes.emplace_back(vaddr, size);
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }

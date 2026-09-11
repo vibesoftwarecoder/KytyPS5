@@ -696,6 +696,9 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
+		// The previous packet has recorded every command that uses the buffer writes it obtained,
+		// so they can take this batch's tick; guest reads queued meanwhile run just below.
+		m_renderer.GetGpuResources().GetBufferCache().StampPendingWrites();
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}

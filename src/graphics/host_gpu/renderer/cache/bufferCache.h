@@ -76,6 +76,10 @@ public:
 		return m_memory_tracker.CpuModifiedGeneration();
 	}
 	[[nodiscard]] uint64_t BufferSetGeneration() const noexcept { return m_buffer_set_generation; }
+	// Gives buffer writes obtained since the last call the tick of the batch being recorded. Call
+	// only when every command using those writes has been recorded (between PM4 packets); until
+	// then a download of their bytes drains, as it did before retired copy-back existed.
+	void StampPendingWrites();
 	void               RunGarbageCollector();
 
 private:
@@ -114,7 +118,7 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
-	void RecordGpuWrite(uint64_t vaddr, uint64_t size);
+	void RecordGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
 	void ForgetGpuWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::optional<uint64_t> GpuWriteTick(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool TryDownloadRetired(std::span<const DownloadCopy> copies);
@@ -131,8 +135,12 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	// Tick of the batch that last wrote each GPU-modified interval: start -> {end, tick}. Covers
-	// exactly the bytes in m_gpu_modified_ranges (GPU thread).
+	// exactly the bytes in m_gpu_modified_ranges (GPU thread). A write is obtained while a draw's
+	// bindings are prepared, and a drain before the draw is recorded moves the draw into a later
+	// batch, so it carries UnstampedTick until StampPendingWrites.
+	static constexpr uint64_t                         UnstampedTick = UINT64_MAX;
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_gpu_write_ticks;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_unstamped_writes; // {vaddr, size}
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
