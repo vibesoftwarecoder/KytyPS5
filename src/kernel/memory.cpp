@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -878,6 +880,34 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+// Local instrumentation: explicit syncs that force a readback (GPU thread only). Small ones are
+// indirect draw arguments and counts; large ones are indirect image tables and similar.
+static void CountExplicitSync(uint64_t size) {
+	static uint64_t small_syncs = 0;
+	static uint64_t large_syncs = 0;
+	static uint64_t large_bytes = 0;
+	static auto     since       = std::chrono::steady_clock::now();
+	if (size <= 32) {
+		small_syncs++;
+	} else {
+		large_syncs++;
+		large_bytes += size;
+	}
+	const auto now     = std::chrono::steady_clock::now();
+	const auto seconds = std::chrono::duration<double>(now - since).count();
+	if (seconds >= 2.0) {
+		std::printf("Explicit syncs: %.0f/s small (indirect args/counts), %.0f/s large (avg %.1f KiB)\n",
+		            static_cast<double>(small_syncs) / seconds,
+		            static_cast<double>(large_syncs) / seconds,
+		            large_syncs == 0 ? 0.0 : static_cast<double>(large_bytes) / large_syncs / 1024.0);
+		std::fflush(stdout);
+		small_syncs = 0;
+		large_syncs = 0;
+		large_bytes = 0;
+		since       = now;
+	}
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
@@ -887,6 +917,7 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		CountExplicitSync(size);
 		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 	}
 	return true;

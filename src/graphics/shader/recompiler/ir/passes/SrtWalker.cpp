@@ -707,7 +707,11 @@ private:
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
 				return false;
 			}
-		} else {
+		} else if (m_runtime.read_specialization_memory == nullptr ||
+		           !m_runtime.read_specialization_memory(m_runtime.userdata, address, &word)) {
+			// The clean reader returns the same bytes without faulting when the GPU did not write
+			// them; a fault here drains the whole GPU queue and reads back a 512 KiB window. Only
+			// GPU-written bytes still take the faulting path.
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
