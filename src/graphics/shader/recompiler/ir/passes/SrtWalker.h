@@ -20,9 +20,13 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
-	// Optional bulk form of read_specialization_memory with the same guarantee for every byte of
-	// the range; it fails when any byte would fail the word reader.
-	SrtMemoryBlockReader      read_specialization_block  = nullptr;
+	// Optional, for ordinary SRT reads: returns a word without faulting when that gives the same
+	// value as a direct read (bytes the GPU has not written) and fails otherwise, so the read
+	// falls back to direct access. Kept apart from read_specialization_memory, which also decides
+	// whether a value may specialize a shader.
+	SrtMemoryReader           read_clean_memory          = nullptr;
+	// Optional bulk form of read_clean_memory; it fails when any byte of the range would fail.
+	SrtMemoryBlockReader      read_clean_block           = nullptr;
 	SrtMemorySync             sync_memory                = nullptr;
 };
 

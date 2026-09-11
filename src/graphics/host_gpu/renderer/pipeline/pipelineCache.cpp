@@ -379,7 +379,8 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
-		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
+		    .read_clean_memory          = ReadShaderGuestMemory,
+		    .read_clean_block           = ReadShaderGuestMemoryBlock,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;

@@ -795,7 +795,7 @@ private:
 class CleanLineCache {
 public:
 	explicit CleanLineCache(const SrtRuntime& runtime)
-	    : m_read_block(runtime.read_specialization_block), m_userdata(runtime.userdata) {}
+	    : m_read_block(runtime.read_clean_block), m_userdata(runtime.userdata) {}
 
 	// True with the word when its whole line is clean; false when the caller must use the word
 	// reader.
@@ -922,14 +922,17 @@ private:
 		return true;
 	}
 
-	// The clean reader, served from a cached line when the word's whole line is clean.
-	bool ReadClean(uint64_t address, uint32_t& word) {
-		g_eval_stats.clean_reads.fetch_add(1, std::memory_order_relaxed);
-		if (m_lines != nullptr && m_lines->Read(address, word)) {
-			g_eval_stats.line_served.fetch_add(1, std::memory_order_relaxed);
-			return true;
+	// Reads one word through reader. When reader is the runtime's clean reader, a cached line
+	// serves the word if the whole line passed the clean checks.
+	bool ReadWith(SrtMemoryReader reader, uint64_t address, uint32_t& word) {
+		if (reader == m_runtime.read_clean_memory) {
+			g_eval_stats.clean_reads.fetch_add(1, std::memory_order_relaxed);
+			if (m_lines != nullptr && m_lines->Read(address, word)) {
+				g_eval_stats.line_served.fetch_add(1, std::memory_order_relaxed);
+				return true;
+			}
 		}
-		return m_runtime.read_specialization_memory(m_runtime.userdata, address, &word);
+		return reader(m_runtime.userdata, address, &word);
 	}
 
 	bool Arg(const Inst& inst, size_t index, uint64_t& result) {
@@ -1027,20 +1030,15 @@ private:
 			}
 		}
 		uint32_t word = 0;
-		if (m_runtime.read_memory != nullptr &&
-		    m_runtime.read_memory != m_runtime.read_specialization_memory) {
-			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
+		if (m_runtime.read_memory != nullptr) {
+			if (!ReadWith(m_runtime.read_memory, address, word)) {
 				return false;
 			}
-		} else if (m_runtime.read_memory != nullptr) {
-			// A clean evaluator: its reader is the clean reader, which the line cache mirrors.
-			if (!ReadClean(address, word)) {
-				return false;
-			}
-		} else if (m_runtime.read_specialization_memory == nullptr || !ReadClean(address, word)) {
-			// The clean reader returns the same bytes without faulting when the GPU did not write
-			// them; a fault here drains the whole GPU queue and reads back a 512 KiB window. Only
-			// GPU-written bytes still take the faulting path.
+		} else if (m_runtime.read_clean_memory == nullptr ||
+		           !ReadWith(m_runtime.read_clean_memory, address, word)) {
+			// An ordinary read is direct. A clean reader, when the runtime has one, returns the same
+			// bytes without faulting when the GPU did not write them; a fault here drains the whole
+			// GPU queue and reads back a 512 KiB window. Only GPU-written bytes still fault.
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
