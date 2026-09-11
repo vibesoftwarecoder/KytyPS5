@@ -92,6 +92,34 @@ void CountReadback(uint64_t bytes, std::chrono::steady_clock::duration wait) {
 	}
 }
 
+// Local instrumentation: how each download was served. Only Served avoids a drain.
+enum class RetiredOutcome : uint8_t { Served, CurrentBatch, InFlight, Untracked, TooLarge, Count };
+
+void CountRetired(RetiredOutcome outcome, std::chrono::steady_clock::duration took = {}) {
+	static uint64_t counts[static_cast<size_t>(RetiredOutcome::Count)] {};
+	static double   served_ms = 0.0;
+	static auto     since     = std::chrono::steady_clock::now();
+	counts[static_cast<size_t>(outcome)]++;
+	served_ms += std::chrono::duration<double, std::milli>(took).count();
+	const auto seconds =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+	if (seconds >= 2.0) {
+		const auto rate = [&](RetiredOutcome which) {
+			return static_cast<double>(counts[static_cast<size_t>(which)]) / seconds;
+		};
+		std::printf("Retired readback: %.0f/s copied without a drain (%.0f ms/s) | still drained: "
+		            "%.0f/s written in the current batch, %.0f/s in flight, %.0f/s untracked, "
+		            "%.0f/s too large\n",
+		            rate(RetiredOutcome::Served), served_ms / seconds,
+		            rate(RetiredOutcome::CurrentBatch), rate(RetiredOutcome::InFlight),
+		            rate(RetiredOutcome::Untracked), rate(RetiredOutcome::TooLarge));
+		std::fflush(stdout);
+		std::fill(std::begin(counts), std::end(counts), uint64_t {0});
+		served_ms = 0.0;
+		since     = std::chrono::steady_clock::now();
+	}
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -200,6 +228,13 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 }
 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	if (TryDownloadRetired(copies)) {
+		for (const auto& copy: copies) {
+			m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+			ForgetGpuWrite(copy.address, copy.size);
+		}
+		return;
+	}
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
 	uint64_t                  packed_size = 0;
@@ -256,7 +291,193 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 	for (const auto& copy: copies) {
 		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+		ForgetGpuWrite(copy.address, copy.size);
 	}
+}
+
+void BufferCache::RecordGpuWrite(uint64_t vaddr, uint64_t size) {
+	ForgetGpuWrite(vaddr, size);
+	const auto tick  = m_scheduler.CurrentTick();
+	auto       begin = vaddr;
+	auto       end   = vaddr + size;
+	// Join neighbours written by the same batch, so draws rewriting adjacent ranges keep the map
+	// as small as the dirty set.
+	auto next = m_gpu_write_ticks.lower_bound(begin);
+	if (next != m_gpu_write_ticks.end() && next->first == end && next->second.second == tick) {
+		end  = next->second.first;
+		next = m_gpu_write_ticks.erase(next);
+	}
+	if (next != m_gpu_write_ticks.begin()) {
+		const auto previous = std::prev(next);
+		if (previous->second.first == begin && previous->second.second == tick) {
+			begin = previous->first;
+			m_gpu_write_ticks.erase(previous);
+		}
+	}
+	m_gpu_write_ticks.emplace(begin, std::pair {end, tick});
+}
+
+void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	auto       it  = m_gpu_write_ticks.upper_bound(vaddr);
+	if (it != m_gpu_write_ticks.begin() && std::prev(it)->second.first > vaddr) {
+		--it;
+	}
+	while (it != m_gpu_write_ticks.end() && it->first < end) {
+		const auto begin        = it->first;
+		const auto [last, tick] = it->second;
+		it                      = m_gpu_write_ticks.erase(it);
+		if (begin < vaddr) {
+			m_gpu_write_ticks.emplace(begin, std::pair {vaddr, tick});
+		}
+		if (last > end) {
+			m_gpu_write_ticks.emplace(end, std::pair {last, tick});
+			break;
+		}
+	}
+}
+
+// Newest recorded write tick over every byte of the range, or nothing when a byte has no record.
+std::optional<uint64_t> BufferCache::GpuWriteTick(uint64_t vaddr, uint64_t size) const {
+	const auto end  = vaddr + size;
+	uint64_t   next = vaddr;
+	uint64_t   tick = 0;
+	auto       it   = m_gpu_write_ticks.upper_bound(vaddr);
+	if (it != m_gpu_write_ticks.begin()) {
+		--it;
+	}
+	for (; it != m_gpu_write_ticks.end() && it->first < end; ++it) {
+		const auto [last, write_tick] = it->second;
+		if (last <= next) {
+			continue;
+		}
+		if (it->first > next) {
+			return std::nullopt;
+		}
+		tick = std::max(tick, write_tick);
+		next = last;
+		if (next >= end) {
+			return tick;
+		}
+	}
+	return std::nullopt;
+}
+
+// Copies GPU writes whose batch has already retired without submitting the batch being recorded
+// or waiting for the GPU to go idle. Waiting on the master timeline at the write's tick makes those
+// writes visible to the copy, and nothing newer can write these bytes: their newest write is that
+// tick. So the copy needs no execution dependency on other work still in flight.
+// Adapted from brandostrong's 283c293 (frangametv/KytyPS5), which also barriered on all commands.
+bool BufferCache::TryDownloadRetired(std::span<const DownloadCopy> copies) {
+	KYTY_PROFILER_FUNCTION();
+	if (copies.empty()) {
+		return false;
+	}
+	uint64_t write_tick  = 0;
+	uint64_t packed_size = 0;
+	for (const auto& copy: copies) {
+		const auto tick = GpuWriteTick(copy.address, copy.size);
+		if (!tick) {
+			CountRetired(RetiredOutcome::Untracked);
+			return false;
+		}
+		write_tick = std::max(write_tick, *tick);
+		packed_size += AlignDownload(DownloadEnvelope(copy).second);
+	}
+	if (packed_size > m_readback_buffer.Size()) {
+		CountRetired(RetiredOutcome::TooLarge);
+		return false;
+	}
+	if (write_tick >= m_scheduler.CurrentTick()) {
+		CountRetired(RetiredOutcome::CurrentBatch);
+		return false;
+	}
+	if (!m_scheduler.IsFree(write_tick)) {
+		CountRetired(RetiredOutcome::InFlight);
+		return false;
+	}
+	const auto started = std::chrono::steady_clock::now();
+
+	auto& device = m_graphics.device;
+	if (m_readback_pool == nullptr) {
+		vk::CommandPoolCreateInfo pool {};
+		pool.queueFamilyIndex = m_graphics.queue_family;
+		pool.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		             vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		EXIT_NOT_IMPLEMENTED(device.createCommandPool(&pool, nullptr, &m_readback_pool) !=
+		                     vk::Result::eSuccess);
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_readback_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		EXIT_NOT_IMPLEMENTED(device.allocateCommandBuffers(&allocate, &m_readback_command) !=
+		                     vk::Result::eSuccess);
+		vk::FenceCreateInfo fence {};
+		EXIT_NOT_IMPLEMENTED(device.createFence(&fence, nullptr, &m_readback_fence) !=
+		                     vk::Result::eSuccess);
+	}
+
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_NOT_IMPLEMENTED(m_readback_command.begin(&begin) != vk::Result::eSuccess);
+	uint64_t cursor = 0;
+	for (const auto& copy: copies) {
+		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+		const vk::BufferCopy region {source_begin, cursor, envelope_size};
+		m_readback_command.copyBuffer(copy.buffer->Handle(), m_readback_buffer.Handle(), 1, &region);
+		cursor += AlignDownload(envelope_size);
+	}
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = m_readback_buffer.Handle();
+	after.offset              = 0;
+	after.size                = cursor;
+	m_readback_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                   vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after,
+	                                   0, nullptr);
+	EXIT_NOT_IMPLEMENTED(m_readback_command.end() != vk::Result::eSuccess);
+
+	const auto                      semaphore  = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &write_tick;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &semaphore;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &m_readback_command;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		EXIT_NOT_IMPLEMENTED(m_graphics.queue.submit(1, &submit, m_readback_fence) !=
+		                     vk::Result::eSuccess);
+	}
+	EXIT_NOT_IMPLEMENTED(device.waitForFences(1, &m_readback_fence, VK_TRUE, UINT64_MAX) !=
+	                     vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(device.resetFences(1, &m_readback_fence) != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(m_readback_command.reset({}) != vk::Result::eSuccess);
+	if (!m_readback_buffer.IsCoherent()) {
+		m_readback_buffer.Invalidate(0, cursor);
+	}
+	// Deferred operations of finished batches (event labels, image downloads) write guest memory.
+	// The drain path lets them land before its copy-back; so does this one, for every batch the
+	// GPU has finished. Work still in flight lands later, after this older data.
+	m_scheduler.WaitPriorityOperations(m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	const auto* mapped = m_readback_buffer.Mapped().data();
+	cursor             = 0;
+	for (const auto& copy: copies) {
+		const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+		const auto offset = cursor + copy.source_offset - source_begin;
+		Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
+		cursor += AlignDownload(envelope_size);
+	}
+	CountRetired(RetiredOutcome::Served, std::chrono::steady_clock::now() - started);
+	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -270,6 +491,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+      m_readback_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, 4 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -294,6 +516,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_readback_pool != nullptr) {
+		m_graphics.device.destroyFence(m_readback_fence);
+		m_graphics.device.destroyCommandPool(m_readback_pool);
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -565,6 +791,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		RecordGpuWrite(vaddr, size);
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }
