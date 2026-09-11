@@ -39,6 +39,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -176,7 +177,10 @@ constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
 static void SetPause(WindowLoopState& game, bool flag) {
-	LOGF("Pause: %s\n", flag ? "true" : "false");
+	// printf, not LOGF: LOGF is silent under the launcher's default --printf-direction, and an
+	// unnoticed pause looks exactly like a hang (the last frame is re-presented at 60 fps).
+	std::printf("Pause: %s\n", flag ? "true" : "false");
+	std::fflush(stdout);
 
 	game.paused.store(flag, std::memory_order_release);
 }

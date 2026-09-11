@@ -4,12 +4,17 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -537,13 +542,245 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+// Local instrumentation: what per-draw evaluation costs and how its clean reads were served.
+struct EvalStats {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> nanoseconds {0};
+	std::atomic<uint64_t> clean_reads {0};
+	std::atomic<uint64_t> line_served {0};
+	std::atomic<uint64_t> line_reads {0};
+	std::atomic<uint64_t> line_failures {0};
+};
+
+EvalStats            g_eval_stats;
+std::atomic<int64_t> g_eval_report_since {0};
+
+void ReportEvalStats() {
+	const auto now   = std::chrono::steady_clock::now().time_since_epoch().count();
+	auto       since = g_eval_report_since.load(std::memory_order_relaxed);
+	if (since == 0) {
+		g_eval_report_since.compare_exchange_strong(since, now, std::memory_order_relaxed);
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::duration(now - since)).count();
+	if (seconds < 2.0 ||
+	    !g_eval_report_since.compare_exchange_strong(since, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto take = [](std::atomic<uint64_t>& counter) {
+		return static_cast<double>(counter.exchange(0, std::memory_order_relaxed));
+	};
+	const auto calls         = take(g_eval_stats.calls);
+	const auto nanoseconds   = take(g_eval_stats.nanoseconds);
+	const auto clean_reads   = take(g_eval_stats.clean_reads);
+	const auto line_served   = take(g_eval_stats.line_served);
+	const auto line_reads    = take(g_eval_stats.line_reads);
+	const auto line_failures = take(g_eval_stats.line_failures);
+	std::printf("SRT eval: %.0f calls/s, %.0f ms/s (avg %.1f us) | clean reads %.0f/s, %.0f%% from lines, "
+	            "%.0f line reads/s, %.0f failed lines/s\n",
+	            calls / seconds, nanoseconds / 1e6 / seconds, calls == 0 ? 0.0 : nanoseconds / 1e3 / calls,
+	            clean_reads / seconds, clean_reads == 0 ? 0.0 : 100.0 * line_served / clean_reads,
+	            line_reads / seconds, line_failures / seconds);
+	std::fflush(stdout);
+}
+
+struct EvalTimer {
+	EvalTimer(): start(std::chrono::steady_clock::now()) {}
+	~EvalTimer() {
+		const auto elapsed = std::chrono::steady_clock::now() - start;
+		g_eval_stats.calls.fetch_add(1, std::memory_order_relaxed);
+		g_eval_stats.nanoseconds.fetch_add(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+		    std::memory_order_relaxed);
+		ReportEvalStats();
+	}
+	EvalTimer(const EvalTimer&)            = delete;
+	EvalTimer& operator=(const EvalTimer&) = delete;
+
+	std::chrono::steady_clock::time_point start;
+};
+
+// Values one evaluator has computed, keyed by instruction. Storage is recycled per thread: a draw
+// evaluates a few hundred values, and a node-based map allocated and freed each one on every draw.
+// Entries left by earlier evaluators are told apart by generation instead of being cleared.
+class MemoTable {
+public:
+	enum class State : uint8_t { Visiting, Done, Retry };
+
+	struct Entry {
+		const Inst* inst       = nullptr;
+		uint64_t    value      = 0;
+		uint32_t    generation = 0;
+		State       state      = State::Retry;
+	};
+
+	MemoTable() {
+		auto& pool = Pool();
+		if (!pool.empty()) {
+			m_storage = std::move(pool.back());
+			pool.pop_back();
+		} else {
+			m_storage.entries.resize(INITIAL_ENTRIES);
+		}
+		if (++m_storage.generation == 0) {
+			for (auto& entry: m_storage.entries) {
+				entry.generation = 0;
+			}
+			m_storage.generation = 1;
+		}
+	}
+
+	~MemoTable() {
+		if (m_storage.entries.size() <= MAX_POOLED_ENTRIES) {
+			Pool().push_back(std::move(m_storage));
+		}
+	}
+
+	MemoTable(const MemoTable&)            = delete;
+	MemoTable& operator=(const MemoTable&) = delete;
+
+	[[nodiscard]] const Entry* Find(const Inst* inst) const {
+		const auto mask = m_storage.entries.size() - 1;
+		for (auto index = Hash(inst) & mask;; index = (index + 1) & mask) {
+			const auto& entry = m_storage.entries[index];
+			if (entry.generation != m_storage.generation) {
+				return nullptr;
+			}
+			if (entry.inst == inst) {
+				return &entry;
+			}
+		}
+	}
+
+	void Set(const Inst* inst, State state, uint64_t value) {
+		auto* entry = const_cast<Entry*>(Find(inst));
+		if (entry == nullptr) {
+			if ((m_count + 1) * 2 > m_storage.entries.size()) {
+				Grow();
+			}
+			entry = &FreeEntry(inst);
+			entry->inst       = inst;
+			entry->generation = m_storage.generation;
+			m_count++;
+		}
+		entry->state = state;
+		entry->value = value;
+	}
+
+private:
+	struct Storage {
+		std::vector<Entry> entries;
+		uint32_t           generation = 0;
+	};
+
+	// Both powers of two: probing masks the hash with size - 1.
+	static constexpr size_t INITIAL_ENTRIES    = 256;
+	static constexpr size_t MAX_POOLED_ENTRIES = 16384;
+
+	static std::vector<Storage>& Pool() {
+		thread_local std::vector<Storage> pool;
+		return pool;
+	}
+
+	static size_t Hash(const Inst* inst) {
+		return static_cast<size_t>(
+		    ((reinterpret_cast<uintptr_t>(inst) >> 4u) * 0x9e3779b97f4a7c15ull) >> 32u);
+	}
+
+	// Entries are never removed, so the first stale slot on the probe path ends it.
+	Entry& FreeEntry(const Inst* inst) {
+		const auto mask = m_storage.entries.size() - 1;
+		for (auto index = Hash(inst) & mask;; index = (index + 1) & mask) {
+			if (m_storage.entries[index].generation != m_storage.generation) {
+				return m_storage.entries[index];
+			}
+		}
+	}
+
+	void Grow() {
+		const auto old            = std::move(m_storage.entries);
+		const auto old_generation = m_storage.generation;
+		m_storage.entries.assign(old.size() * 2, Entry {});
+		m_storage.generation = 1;
+		for (const auto& entry: old) {
+			if (entry.generation == old_generation) {
+				auto& moved      = FreeEntry(entry.inst);
+				moved            = entry;
+				moved.generation = 1;
+			}
+		}
+	}
+
+	Storage m_storage;
+	size_t  m_count = 0;
+};
+
+// Guest words read through the clean reader during one evaluation, kept by aligned line. SRT tables
+// are read a word at a time, and each clean read takes two locks and three tree lookups; one line
+// read serves its neighbours. A line that fails the clean checks as a whole is remembered as failed
+// and its words still go through the word reader, so a word beside GPU-written bytes is judged
+// exactly as before.
+class CleanLineCache {
+public:
+	explicit CleanLineCache(const SrtRuntime& runtime)
+	    : m_read_block(runtime.read_specialization_block), m_userdata(runtime.userdata) {}
+
+	// True with the word when its whole line is clean; false when the caller must use the word
+	// reader.
+	bool Read(uint64_t address, uint32_t& word) {
+		if (m_read_block == nullptr || (address & 3u) != 0u) {
+			return false;
+		}
+		const auto base = address & ~(LINE_BYTES - 1u);
+		Line*      line = nullptr;
+		for (auto& candidate: m_lines) {
+			if (candidate.state != LineState::Empty && candidate.base == base) {
+				line = &candidate;
+				break;
+			}
+		}
+		if (line == nullptr) {
+			line        = &m_lines[m_next];
+			m_next      = (m_next + 1) % m_lines.size();
+			line->base  = base;
+			line->state = m_read_block(m_userdata, base, line->bytes.data(), LINE_BYTES)
+			                  ? LineState::Clean
+			                  : LineState::Failed;
+			(line->state == LineState::Clean ? g_eval_stats.line_reads : g_eval_stats.line_failures)
+			    .fetch_add(1, std::memory_order_relaxed);
+		}
+		if (line->state != LineState::Clean) {
+			return false;
+		}
+		std::memcpy(&word, line->bytes.data() + (address - base), sizeof(word));
+		return true;
+	}
+
+private:
+	static constexpr uint64_t LINE_BYTES = 128;
+	static constexpr size_t   LINES      = 8;
+
+	enum class LineState : uint8_t { Empty, Clean, Failed };
+
+	struct Line {
+		uint64_t                         base  = 0;
+		LineState                        state = LineState::Empty;
+		std::array<uint8_t, LINE_BYTES> bytes;
+	};
+
+	SrtMemoryBlockReader     m_read_block = nullptr;
+	void*                    m_userdata   = nullptr;
+	std::array<Line, LINES>  m_lines;
+	size_t                   m_next = 0;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
-	          Value active_mask = {})
+	          Value active_mask = {}, CleanLineCache* lines = nullptr)
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()), m_lines(lines) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -578,34 +815,40 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
-		if (!m_reserved) {
-			// A draw evaluates a few dozen values; reserving for every value in the program made
-			// each draw allocate, clear and free tables sized for the whole shader.
-			m_cache.reserve(INITIAL_CACHE_SIZE);
-			m_visiting.reserve(INITIAL_CACHE_SIZE);
-			m_reserved = true;
-		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
-			return true;
+		if (const auto* memo = m_memo.Find(inst); memo != nullptr) {
+			if (memo->state == MemoTable::State::Done) {
+				result = memo->value;
+				return true;
+			}
+			// Visiting means inst is on the current evaluation path: a cycle.
+			if (memo->state == MemoTable::State::Visiting) {
+				return false;
+			}
+			// Retry marks an earlier failure. Failures are evaluated again, never memoized.
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
-			return false;
-		}
-		m_visiting.push_back(inst);
-		uint64_t out = 0;
+		m_memo.Set(inst, MemoTable::State::Visiting, 0);
+		uint64_t   out       = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
-		m_visiting.pop_back();
+		m_memo.Set(inst, evaluated ? MemoTable::State::Done : MemoTable::State::Retry, out);
 		if (!evaluated) {
 			return false;
 		}
-		m_cache.emplace(inst, out);
 		result = out;
 		return true;
+	}
+
+	// The clean reader, served from a cached line when the word's whole line is clean.
+	bool ReadClean(uint64_t address, uint32_t& word) {
+		g_eval_stats.clean_reads.fetch_add(1, std::memory_order_relaxed);
+		if (m_lines != nullptr && m_lines->Read(address, word)) {
+			g_eval_stats.line_served.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
+		return m_runtime.read_specialization_memory(m_runtime.userdata, address, &word);
 	}
 
 	bool Arg(const Inst& inst, size_t index, uint64_t& result) {
@@ -703,12 +946,17 @@ private:
 			}
 		}
 		uint32_t word = 0;
-		if (m_runtime.read_memory != nullptr) {
+		if (m_runtime.read_memory != nullptr &&
+		    m_runtime.read_memory != m_runtime.read_specialization_memory) {
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
 				return false;
 			}
-		} else if (m_runtime.read_specialization_memory == nullptr ||
-		           !m_runtime.read_specialization_memory(m_runtime.userdata, address, &word)) {
+		} else if (m_runtime.read_memory != nullptr) {
+			// A clean evaluator: its reader is the clean reader, which the line cache mirrors.
+			if (!ReadClean(address, word)) {
+				return false;
+			}
+		} else if (m_runtime.read_specialization_memory == nullptr || !ReadClean(address, word)) {
 			// The clean reader returns the same bytes without faulting when the GPU did not write
 			// them; a fault here drains the whole GPU queue and reads back a 512 KiB window. Only
 			// GPU-written bytes still take the faulting path.
@@ -740,7 +988,7 @@ private:
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
 				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1));
+				                 inst.Arg(1), m_lines);
 				return active.EvaluateWide(inst.Arg(0), result);
 			}
 			case ValueOpcode::BitCastU32F32:
@@ -1071,16 +1319,13 @@ private:
 		return false;
 	}
 
-	static constexpr size_t INITIAL_CACHE_SIZE = 64;
-
-	const ResourcePlan&                       m_program;
-	const SrtRuntime&                         m_runtime;
-	std::span<const uint8_t>                  m_clean_flat_slots;
-	Evaluator*                                m_clean_evaluator = nullptr;
-	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
+	const ResourcePlan&      m_program;
+	const SrtRuntime&        m_runtime;
+	std::span<const uint8_t> m_clean_flat_slots;
+	Evaluator*               m_clean_evaluator = nullptr;
+	Value                    m_active_mask;
+	CleanLineCache*          m_lines = nullptr;
+	MemoTable                m_memo;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -1102,10 +1347,12 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    runtime.read_specialization_memory == nullptr) {
 		return false;
 	}
+	const EvalTimer timer;
+	CleanLineCache  lines(runtime);
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
-	Evaluator            clean_evaluator(program, clean_runtime);
-	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
+	Evaluator            clean_evaluator(program, clean_runtime, {}, nullptr, {}, &lines);
+	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator, {}, &lines);
 	std::vector<uint8_t> active;
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
@@ -1210,7 +1457,8 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	clean.read_memory = runtime.read_specialization_memory != nullptr
 	                        ? runtime.read_specialization_memory
 	                        : +[](void*, uint64_t, uint32_t*) { return false; };
-	Evaluator evaluator(program, clean);
+	CleanLineCache lines(runtime);
+	Evaluator      evaluator(program, clean, {}, nullptr, {}, &lines);
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (!evaluator.Evaluate(values[i], results[i])) {
 			return false;

@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -102,8 +103,33 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
+bool ReadShaderGuestMemoryBlock(void*, uint64_t address, void* data, uint64_t size) {
+	return data != nullptr && Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
+}
+
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
+}
+
+// Local instrumentation: per-draw resource materialization on a cached program, per thread.
+void CountMaterialize(std::chrono::steady_clock::duration elapsed) {
+	thread_local uint64_t                            calls = 0;
+	thread_local std::chrono::steady_clock::duration total {};
+	thread_local auto                                since = std::chrono::steady_clock::now();
+	calls++;
+	total += elapsed;
+	const auto now     = std::chrono::steady_clock::now();
+	const auto seconds = std::chrono::duration<double>(now - since).count();
+	if (seconds >= 2.0) {
+		const auto ms = std::chrono::duration<double, std::milli>(total).count();
+		std::printf("Materialize: %.0f calls/s, %.0f ms/s (avg %.1f us)\n",
+		            static_cast<double>(calls) / seconds, ms / seconds,
+		            calls == 0 ? 0.0 : ms * 1000.0 / static_cast<double>(calls));
+		std::fflush(stdout);
+		calls = 0;
+		total = {};
+		since = now;
+	}
 }
 
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
@@ -325,14 +351,16 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          entry->second.resource_plan, runtime, resources,
-			                          specialization, &report));
+			const auto materialize_start = std::chrono::steady_clock::now();
+			const bool materialized      = ShaderRecompiler::IR::MaterializeResources(
+			    entry->second.resource_plan, runtime, resources, specialization, &report);
+			CountMaterialize(std::chrono::steady_clock::now() - materialize_start);
+			ReportMaterialization(label, stage, params.hash, report, materialized);
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
