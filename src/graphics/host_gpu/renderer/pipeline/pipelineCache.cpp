@@ -22,6 +22,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include "common/localToggles.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -122,19 +124,26 @@ uint64_t HashMaterializeInputs(std::span<const uint32_t> user_data, uint64_t sha
 	return hash ^ (static_cast<uint64_t>(user_data.size()) << 56u);
 }
 
+// How a materialization on a cached program was served (see SourceEntry::FindReusable).
+enum class ReuseOutcome : uint8_t { Reused, MemoryChanged, NoMatch, Disabled, Count };
+
 // Local instrumentation: per-draw resource materialization on a cached program, per thread.
 // repeat_last: the same program's previous materialization had the same register inputs.
-// repeat_recent: one of its last eight did.
+// repeat_recent: one of its last eight did. not_reusable: a fresh result could not be stored.
 void CountMaterialize(std::chrono::steady_clock::duration elapsed, bool repeat_last,
-                      bool repeat_recent) {
-	thread_local uint64_t                            calls         = 0;
-	thread_local uint64_t                            repeat_lasts  = 0;
-	thread_local uint64_t                            repeat_recents = 0;
+                      bool repeat_recent, ReuseOutcome reuse, bool not_reusable) {
+	thread_local uint64_t calls          = 0;
+	thread_local uint64_t repeat_lasts   = 0;
+	thread_local uint64_t repeat_recents = 0;
+	thread_local uint64_t not_reusables  = 0;
+	thread_local uint64_t reuses[static_cast<size_t>(ReuseOutcome::Count)] {};
 	thread_local std::chrono::steady_clock::duration total {};
 	thread_local auto                                since = std::chrono::steady_clock::now();
 	calls++;
 	repeat_lasts += repeat_last ? 1u : 0u;
 	repeat_recents += repeat_recent ? 1u : 0u;
+	not_reusables += not_reusable ? 1u : 0u;
+	reuses[static_cast<size_t>(reuse)]++;
 	total += elapsed;
 	const auto now     = std::chrono::steady_clock::now();
 	const auto seconds = std::chrono::duration<double>(now - since).count();
@@ -143,17 +152,24 @@ void CountMaterialize(std::chrono::steady_clock::duration elapsed, bool repeat_l
 		const auto pct = [&](uint64_t count) {
 			return calls == 0 ? 0.0 : 100.0 * static_cast<double>(count) / static_cast<double>(calls);
 		};
-		std::printf("Materialize: %.0f calls/s, %.0f ms/s (avg %.1f us) | same inputs as the "
-		            "program's last call %.0f%%, as one of its last 8 %.0f%%\n",
+		std::printf("Materialize: %.0f calls/s, %.0f ms/s (avg %.1f us) | reused %.0f%%, inputs "
+		            "matched but memory changed %.0f%%, no match %.0f%%, result not reusable "
+		            "%.0f%% | same inputs as the program's last call %.0f%%, as one of its last 8 "
+		            "%.0f%%\n",
 		            static_cast<double>(calls) / seconds, ms / seconds,
-		            calls == 0 ? 0.0 : ms * 1000.0 / static_cast<double>(calls), pct(repeat_lasts),
-		            pct(repeat_recents));
+		            calls == 0 ? 0.0 : ms * 1000.0 / static_cast<double>(calls),
+		            pct(reuses[static_cast<size_t>(ReuseOutcome::Reused)]),
+		            pct(reuses[static_cast<size_t>(ReuseOutcome::MemoryChanged)]),
+		            pct(reuses[static_cast<size_t>(ReuseOutcome::NoMatch)]), pct(not_reusables),
+		            pct(repeat_lasts), pct(repeat_recents));
 		std::fflush(stdout);
 		calls          = 0;
 		repeat_lasts   = 0;
 		repeat_recents = 0;
-		total          = {};
-		since          = now;
+		not_reusables  = 0;
+		std::fill(std::begin(reuses), std::end(reuses), uint64_t {0});
+		total = {};
+		since = now;
 	}
 }
 
@@ -274,8 +290,66 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
+		// A materialization depends only on the plan, the user data, the shader base and the guest
+		// words it reads (SrtReadLog). So a stored result is exactly what a fresh one would be when
+		// the register inputs match and every logged word still reads the same.
+		ReuseOutcome FindReusable(std::span<const uint32_t> user_data, uint64_t shader_base,
+		                          const ShaderRecompiler::IR::SrtRuntime&       runtime,
+		                          ShaderRecompiler::IR::ResourceSnapshot&       resources,
+		                          ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+			for (auto& result: reusable) {
+				if (!result.valid || result.shader_base != shader_base ||
+				    !std::ranges::equal(result.user_data, user_data)) {
+					continue;
+				}
+				if (!ShaderRecompiler::IR::VerifySrtReads(runtime, result.reads)) {
+					result.valid = false;
+					return ReuseOutcome::MemoryChanged;
+				}
+				resources      = result.resources;
+				specialization = result.specialization;
+				return ReuseOutcome::Reused;
+			}
+			return ReuseOutcome::NoMatch;
+		}
+
+		void StoreReusable(std::span<const uint32_t> user_data, uint64_t shader_base,
+		                   std::vector<std::pair<uint64_t, uint32_t>>&&      reads,
+		                   const ShaderRecompiler::IR::ResourceSnapshot&       resources,
+		                   const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+			ReusableResult* slot = nullptr;
+			for (auto& result: reusable) {
+				if (result.valid && result.shader_base == shader_base &&
+				    std::ranges::equal(result.user_data, user_data)) {
+					slot = &result;
+					break;
+				}
+			}
+			if (slot == nullptr) {
+				slot          = &reusable[reusable_next];
+				reusable_next = (reusable_next + 1) % reusable.size();
+			}
+			slot->user_data.assign(user_data.begin(), user_data.end());
+			slot->shader_base    = shader_base;
+			slot->reads          = std::move(reads);
+			slot->resources      = resources;
+			slot->specialization = specialization;
+			slot->valid          = true;
+		}
+
+		struct ReusableResult {
+			std::vector<uint32_t>                        user_data;
+			uint64_t                                     shader_base = 0;
+			std::vector<std::pair<uint64_t, uint32_t>>   reads;
+			ShaderRecompiler::IR::ResourceSnapshot       resources;
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			bool                                         valid = false;
+		};
+
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
+		std::array<ReusableResult, 4>      reusable;
+		uint32_t                           reusable_next = 0;
 		// Local instrumentation: input hashes of this program's recent materializations.
 		std::array<uint64_t, 8> recent_inputs {};
 		uint32_t                recent_next = 0;
@@ -385,9 +459,32 @@ struct PipelineCache::ProgramCache {
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			const auto materialize_start = std::chrono::steady_clock::now();
-			const bool materialized      = ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization, &report);
+			const auto        materialize_start = std::chrono::steady_clock::now();
+			auto&             source            = entry->second;
+			static const bool reuse_disabled    = Common::LocalFeatureDisabled("matreuse");
+			auto              reuse             = ReuseOutcome::Disabled;
+			bool              materialized      = false;
+			bool              not_reusable      = false;
+			if (!reuse_disabled) {
+				reuse        = source.FindReusable(params.user_data, params.Base(), runtime,
+				                                   resources, specialization);
+				materialized = reuse == ReuseOutcome::Reused;
+			}
+			if (!materialized) {
+				ShaderRecompiler::IR::SrtReadLog log;
+				auto                             logged = runtime;
+				logged.read_log                         = reuse_disabled ? nullptr : &log;
+				materialized = ShaderRecompiler::IR::MaterializeResources(
+				    source.resource_plan, logged, resources, specialization, &report);
+				if (materialized && !reuse_disabled) {
+					if (log.reusable) {
+						source.StoreReusable(params.user_data, params.Base(), std::move(log.words),
+						                     resources, specialization);
+					} else {
+						not_reusable = true;
+					}
+				}
+			}
 			const auto materialize_time = std::chrono::steady_clock::now() - materialize_start;
 			auto&      recent           = entry->second.recent_inputs;
 			const auto inputs = HashMaterializeInputs(params.user_data, params.Base());
@@ -395,7 +492,7 @@ struct PipelineCache::ProgramCache {
 			const bool repeat_recent = std::ranges::find(recent, inputs) != recent.end();
 			recent[entry->second.recent_next] = inputs;
 			entry->second.recent_next = (entry->second.recent_next + 1) % recent.size();
-			CountMaterialize(materialize_time, last == inputs, repeat_recent);
+			CountMaterialize(materialize_time, last == inputs, repeat_recent, reuse, not_reusable);
 			ReportMaterialization(label, stage, params.hash, report, materialized);
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {

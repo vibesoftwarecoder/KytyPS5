@@ -944,14 +944,35 @@ private:
 	// Reads one word through reader. When reader is the runtime's clean reader, a cached line
 	// serves the word if the whole line passed the clean checks.
 	bool ReadWith(SrtMemoryReader reader, uint64_t address, uint32_t& word) {
+		bool read = false;
 		if (reader == m_runtime.read_clean_memory) {
 			g_eval_stats.clean_reads.fetch_add(1, std::memory_order_relaxed);
 			if (m_lines != nullptr && m_lines->Read(address, word)) {
 				g_eval_stats.line_served.fetch_add(1, std::memory_order_relaxed);
-				return true;
+				read = true;
 			}
 		}
-		return reader(m_runtime.userdata, address, &word);
+		if (!read) {
+			read = reader(m_runtime.userdata, address, &word);
+		}
+		LogRead(reader, read, address, word);
+		return read;
+	}
+
+	// Records a read for reuse checks (SrtReadLog). Only a successful read through a clean reader
+	// can be checked again later; anything else makes the result not reusable.
+	void LogRead(SrtMemoryReader reader, bool read, uint64_t address, uint32_t word) const {
+		auto* log = m_runtime.read_log;
+		if (log == nullptr) {
+			return;
+		}
+		if (read && reader != nullptr &&
+		    (reader == m_runtime.read_clean_memory ||
+		     reader == m_runtime.read_specialization_memory)) {
+			log->words.emplace_back(address, word);
+		} else {
+			log->reusable = false;
+		}
 	}
 
 	bool Arg(const Inst& inst, size_t index, uint64_t& result) {
@@ -1058,6 +1079,7 @@ private:
 			// An ordinary read is direct. A clean reader, when the runtime has one, returns the same
 			// bytes without faulting when the GPU did not write them; a fault here drains the whole
 			// GPU queue and reads back a 512 KiB window. Only GPU-written bytes still fault.
+			LogRead(nullptr, false, address, word);
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
@@ -1560,6 +1582,26 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	Evaluator      evaluator(program, clean, {}, nullptr, {}, &lines);
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (!evaluator.Evaluate(values[i], results[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool VerifySrtReads(const SrtRuntime&                              runtime,
+                    std::span<const std::pair<uint64_t, uint32_t>> words) {
+	if (runtime.read_clean_memory == nullptr ||
+	    runtime.read_clean_memory != runtime.read_specialization_memory) {
+		return false;
+	}
+	CleanLineCache lines(runtime);
+	for (const auto& [address, expected]: words) {
+		uint32_t word = 0;
+		if (!lines.Read(address, word) &&
+		    !runtime.read_clean_memory(runtime.userdata, address, &word)) {
+			return false;
+		}
+		if (word != expected) {
 			return false;
 		}
 	}

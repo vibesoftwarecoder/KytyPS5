@@ -242,8 +242,16 @@ uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
 }
 
 bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
-	return runtime.read_specialization_memory != nullptr &&
-	       runtime.read_specialization_memory(runtime.userdata, address, &word);
+	const bool read = runtime.read_specialization_memory != nullptr &&
+	                  runtime.read_specialization_memory(runtime.userdata, address, &word);
+	if (runtime.read_log != nullptr) {
+		if (read) {
+			runtime.read_log->words.emplace_back(address, word);
+		} else {
+			runtime.read_log->reusable = false;
+		}
+	}
+	return read;
 }
 
 void MakeRangeReadable(const SrtRuntime& runtime, uint64_t base, uint64_t size) {

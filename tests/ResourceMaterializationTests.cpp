@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace {
@@ -17,6 +19,12 @@ void Check(bool value, const char *text) {
 bool RejectSpecializationRead(void *userdata, uint64_t, uint32_t *) {
   ++*static_cast<uint32_t *>(userdata);
   return false;
+}
+
+// A clean reader for test memory: every word reads as it is.
+bool ReadTestWord(void *, uint64_t address, uint32_t *word) {
+  std::memcpy(word, reinterpret_cast<const void *>(address), sizeof(*word));
+  return true;
 }
 
 Libs::Graphics::ShaderRecompiler::IR::Block &
@@ -159,6 +167,55 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
+void TestReadLogVerifiesReuse() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t dword = 0x12345678;
+  const auto address = reinterpret_cast<uint64_t>(&dword);
+  auto plan = SrtPlan(address);
+  SrtReadLog log;
+  const SrtRuntime runtime{.read_specialization_memory = ReadTestWord,
+                           .read_clean_memory = ReadTestWord,
+                           .read_log = &log};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "logged materialization failed");
+  Check(log.reusable, "clean reads made the result not reusable");
+  bool logged = false;
+  for (const auto &[read_address, word] : log.words) {
+    logged = logged || (read_address == address && word == dword);
+  }
+  Check(logged, "the SRT word was not logged");
+  const SrtRuntime verify{.read_specialization_memory = ReadTestWord,
+                          .read_clean_memory = ReadTestWord};
+  Check(VerifySrtReads(verify, log.words),
+        "unchanged memory failed verification");
+  dword = 0x9abcdef0u;
+  Check(!VerifySrtReads(verify, log.words),
+        "changed memory passed verification");
+}
+
+void TestFailedReadIsNotReusable() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const uint32_t dword = 0x12345678;
+  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  SrtReadLog log;
+  uint32_t rejected_reads = 0;
+  const SrtRuntime runtime{.userdata = &rejected_reads,
+                           .read_specialization_memory =
+                               RejectSpecializationRead,
+                           .read_clean_memory = RejectSpecializationRead,
+                           .read_log = &log};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "materialization with a rejecting clean reader failed");
+  Check(snapshot.flattened_srt.size() == 1 &&
+            snapshot.flattened_srt[0] == dword,
+        "a rejected clean read did not fall back to the direct read");
+  Check(!log.reusable, "a rejected read left the result reusable");
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtPlan(0x10000);
@@ -266,6 +323,8 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestReadLogVerifiesReuse();
+  TestFailedReadIsNotReusable();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationPreservesPriorStage();

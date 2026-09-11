@@ -5,10 +5,20 @@
 
 #include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
+
+// Guest words one materialization read, in order, so a later call with the same register inputs
+// can check them instead of evaluating again. A read that failed, or bypassed the clean reader,
+// makes the result depend on more than these words, so it is then not reusable.
+struct SrtReadLog {
+	std::vector<std::pair<uint64_t, uint32_t>> words;
+	bool                                       reusable = true;
+};
 
 using SrtMemoryReader      = bool (*)(void* userdata, uint64_t address, uint32_t* value);
 using SrtMemoryBlockReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
@@ -28,7 +38,15 @@ struct SrtRuntime {
 	// Optional bulk form of read_clean_memory; it fails when any byte of the range would fail.
 	SrtMemoryBlockReader      read_clean_block           = nullptr;
 	SrtMemorySync             sync_memory                = nullptr;
+	// Optional: every guest word read is recorded here (see SrtReadLog).
+	SrtReadLog*               read_log                   = nullptr;
 };
+
+// True when every logged word still reads the same through the runtime's clean reader. Needs
+// read_clean_memory and read_specialization_memory to be the same reader, as the pipeline cache
+// sets them, since a log mixes words read through both; false otherwise.
+bool VerifySrtReads(const SrtRuntime& runtime,
+                    std::span<const std::pair<uint64_t, uint32_t>> words);
 
 enum class RuntimeValueType { Any, Integer };
 
