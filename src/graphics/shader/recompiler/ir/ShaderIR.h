@@ -534,6 +534,9 @@ struct ResourcePlan {
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Values in value_storage carry eval slots 0..eval_slot_count-1 (Inst::GetEvalSlot).
+	// 0 for a Program, whose instructions are not numbered.
+	uint32_t                            eval_slot_count                = 0;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

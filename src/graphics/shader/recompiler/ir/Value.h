@@ -144,17 +144,49 @@ public:
 		std::memcpy(&flags, &value, sizeof(value));
 	}
 
+	// Dense index ExtractResourcePlan gives each value of a resource plan, so per-draw evaluation
+	// can memoize in a flat array. NoEvalSlot for every other instruction.
+	static constexpr uint32_t NoEvalSlot = 0xffffffffu;
+	[[nodiscard]] uint32_t    GetEvalSlot() const { return eval_slot; }
+	void                      SetEvalSlot(uint32_t slot) { eval_slot = slot; }
+
 private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	uint32_t            eval_slot = NoEvalSlot;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;
 	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
 };
+
+// Inline because the SRT evaluator calls these for every value it visits, on every draw.
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Value Value::Resolve() const {
+	Value value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

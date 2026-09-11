@@ -715,6 +715,78 @@ private:
 	size_t  m_count = 0;
 };
 
+// The same memo for values of an extracted plan, indexed by the dense slot ExtractResourcePlan
+// gives each one: one array access per visit instead of hash probes. Storage is recycled per
+// thread and entries from earlier evaluators are told apart by generation, as in MemoTable.
+class DenseMemo {
+public:
+	using State = MemoTable::State;
+
+	struct Entry {
+		uint64_t value      = 0;
+		uint32_t generation = 0;
+		State    state      = State::Retry;
+	};
+
+	explicit DenseMemo(uint32_t slots) {
+		if (slots == 0) {
+			return;
+		}
+		auto& pool = Pool();
+		if (!pool.empty()) {
+			m_storage = std::move(pool.back());
+			pool.pop_back();
+		}
+		if (m_storage.entries.size() < slots) {
+			m_storage.entries.resize(slots);
+		}
+		if (++m_storage.generation == 0) {
+			for (auto& entry: m_storage.entries) {
+				entry.generation = 0;
+			}
+			m_storage.generation = 1;
+		}
+		m_active = true;
+	}
+
+	~DenseMemo() {
+		if (m_active && m_storage.entries.size() <= MAX_POOLED_ENTRIES) {
+			Pool().push_back(std::move(m_storage));
+		}
+	}
+
+	DenseMemo(const DenseMemo&)            = delete;
+	DenseMemo& operator=(const DenseMemo&) = delete;
+
+	[[nodiscard]] const Entry* Find(uint32_t slot) const {
+		const auto& entry = m_storage.entries[slot];
+		return entry.generation == m_storage.generation ? &entry : nullptr;
+	}
+
+	void Set(uint32_t slot, State state, uint64_t value) {
+		auto& entry      = m_storage.entries[slot];
+		entry.generation = m_storage.generation;
+		entry.state      = state;
+		entry.value      = value;
+	}
+
+private:
+	struct Storage {
+		std::vector<Entry> entries;
+		uint32_t           generation = 0;
+	};
+
+	static constexpr size_t MAX_POOLED_ENTRIES = 65536;
+
+	static std::vector<Storage>& Pool() {
+		thread_local std::vector<Storage> pool;
+		return pool;
+	}
+
+	Storage m_storage;
+	bool    m_active = false;
+};
+
 // Guest words read through the clean reader during one evaluation, kept by aligned line. SRT tables
 // are read a word at a time, and each clean read takes two locks and three tree lookups; one line
 // read serves its neighbours. A line that fails the clean checks as a whole is remembered as failed
@@ -780,7 +852,8 @@ public:
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {}, CleanLineCache* lines = nullptr)
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()), m_lines(lines) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()), m_lines(lines),
+	      m_dense(program.eval_slot_count) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -819,21 +892,29 @@ private:
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto* memo = m_memo.Find(inst); memo != nullptr) {
-			if (memo->state == MemoTable::State::Done) {
-				result = memo->value;
+		if (const auto slot = inst->GetEvalSlot(); slot < m_program.eval_slot_count) {
+			return EvaluateMemoized(m_dense, slot, *inst, result);
+		}
+		return EvaluateMemoized(m_memo, static_cast<const Inst*>(inst), *inst, result);
+	}
+
+	template <typename Memo, typename Key>
+	bool EvaluateMemoized(Memo& memo, Key key, const Inst& inst, uint64_t& result) {
+		if (const auto* entry = memo.Find(key); entry != nullptr) {
+			if (entry->state == MemoTable::State::Done) {
+				result = entry->value;
 				return true;
 			}
 			// Visiting means inst is on the current evaluation path: a cycle.
-			if (memo->state == MemoTable::State::Visiting) {
+			if (entry->state == MemoTable::State::Visiting) {
 				return false;
 			}
 			// Retry marks an earlier failure. Failures are evaluated again, never memoized.
 		}
-		m_memo.Set(inst, MemoTable::State::Visiting, 0);
+		memo.Set(key, MemoTable::State::Visiting, 0);
 		uint64_t   out       = 0;
-		const bool evaluated = EvaluateInst(*inst, out);
-		m_memo.Set(inst, evaluated ? MemoTable::State::Done : MemoTable::State::Retry, out);
+		const bool evaluated = EvaluateInst(inst, out);
+		memo.Set(key, evaluated ? MemoTable::State::Done : MemoTable::State::Retry, out);
 		if (!evaluated) {
 			return false;
 		}
@@ -1326,6 +1407,7 @@ private:
 	Value                    m_active_mask;
 	CleanLineCache*          m_lines = nullptr;
 	MemoTable                m_memo;
+	DenseMemo                m_dense;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {

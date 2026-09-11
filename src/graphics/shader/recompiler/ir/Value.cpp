@@ -29,14 +29,6 @@ bool Value::IsEmpty() const {
 	return type == Type::Void;
 }
 
-bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
 bool Value::IsPhi() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
 }
@@ -56,17 +48,12 @@ Inst* Value::Instruction() const {
 	return inst;
 }
 
-Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
 Inst* Value::ResolveInstruction() const {
 	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+	// Identities are opaque by definition, so only the end of the chain needs checking.
+	const auto resolved = Resolve();
+	EXIT_IF(resolved.type != Type::Opaque);
+	return resolved.inst;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -144,10 +131,6 @@ Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
 
 Inst::~Inst() {
 	ClearArgs();
-}
-
-ValueOpcode Inst::GetOpcode() const {
-	return opcode;
 }
 
 Type Inst::GetType() const {

@@ -1283,6 +1283,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
+	// Every value the plan's evaluation can reach was cloned into value_storage above. Dense
+	// slots let the per-draw evaluator memoize in a flat array instead of a hash table.
+	uint32_t slot = 0;
+	for (auto& inst: plan.value_storage) {
+		inst.SetEvalSlot(slot++);
+	}
+	plan.eval_slot_count = slot;
 	return plan;
 }
 
