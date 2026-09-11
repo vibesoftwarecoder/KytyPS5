@@ -65,6 +65,8 @@ inline int controller_get_axis(int min, int max, int value) {
 
 void Connect(int id);
 void Disconnect(int id);
+// False when --controller name:TEXT excludes a controller with this name.
+[[nodiscard]] bool ControllerNameAllowed(const char* name);
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);

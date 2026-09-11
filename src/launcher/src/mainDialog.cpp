@@ -257,6 +257,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;
 	}
+	for (const auto& binding: info.controller_mapping) {
+		args << "--padmap" << binding;
+	}
+	args << "--controller" << info.controller_selection;
 	if (info.renderdoc_enabled) {
 		args << "--rd";
 	}
@@ -497,7 +501,9 @@ void MainDialogPrivate::Run() {
 
 	Configuration info;
 	info.CopyFrom(m_running_item->GetInfo());
-	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
+	info.host_input_mapping   = m_ui->widget->GetHostInputMapping();
+	info.controller_mapping   = m_ui->widget->GetControllerMapping();
+	info.controller_selection = m_ui->widget->GetControllerSelection();
 	m_main_dialog->RunInterpreter(&m_process, info);
 
 	Update();

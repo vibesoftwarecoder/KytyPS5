@@ -137,4 +137,12 @@ const Keymap& GetKeymap() {
 	return g_config->keymap;
 }
 
+const Keymap& GetPadmap() {
+	return g_config->padmap;
+}
+
+const std::string& GetControllerSelection() {
+	return g_config->controller_selection;
+}
+
 } // namespace Config

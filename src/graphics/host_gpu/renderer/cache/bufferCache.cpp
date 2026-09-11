@@ -13,7 +13,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -25,6 +27,33 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// Local instrumentation: every download flush drains the whole GPU queue before copying back.
+struct ReadbackStats {
+	uint64_t                              drains  = 0;
+	uint64_t                              bytes   = 0;
+	double                                wait_ms = 0.0;
+	std::chrono::steady_clock::time_point since   = std::chrono::steady_clock::now();
+};
+
+ReadbackStats g_readback_stats;
+
+void CountReadback(uint64_t bytes, std::chrono::steady_clock::duration wait) {
+	auto& stats = g_readback_stats;
+	stats.drains++;
+	stats.bytes += bytes;
+	stats.wait_ms += std::chrono::duration<double, std::milli>(wait).count();
+	const auto seconds =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - stats.since).count();
+	if (seconds >= 2.0) {
+		// printf, not LOGF: LOGF is silent under the launcher's default --printf-direction.
+		std::printf("Readback: %.1f GPU drains/s, %.0f ms/s waiting, %.2f MiB/s downloaded\n",
+		            static_cast<double>(stats.drains) / seconds, stats.wait_ms / seconds,
+		            static_cast<double>(stats.bytes) / seconds / static_cast<double>(MiB));
+		std::fflush(stdout);
+		stats = {};
+	}
+}
 
 } // namespace
 
@@ -151,8 +180,10 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		}
 		download.Commit();
 		const auto completion_tick = m_scheduler.CurrentTick();
+		const auto wait_start      = std::chrono::steady_clock::now();
 		m_scheduler.Finish();
 		m_scheduler.WaitPriorityOperations(completion_tick);
+		CountReadback(packed_size, std::chrono::steady_clock::now() - wait_start);
 		cursor = 0;
 		for (const auto& copy: batch) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);

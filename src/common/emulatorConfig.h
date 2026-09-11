@@ -71,7 +71,9 @@ struct ConfigOptions {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
-	Keymap keymap;
+	Keymap      keymap;
+	Keymap      padmap;
+	std::string controller_selection = "first";
 };
 
 void Load(const ConfigOptions& cfg);
@@ -113,7 +115,9 @@ bool PlayGoHackEnabled();
 bool RedZoneProtectionEnabled();
 #endif
 
-const Keymap& GetKeymap();
+const Keymap&      GetKeymap();
+const Keymap&      GetPadmap();
+const std::string& GetControllerSelection();
 
 } // namespace Config
 

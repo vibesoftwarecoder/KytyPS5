@@ -69,26 +69,6 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
-static uint32_t ControllerButtonToPadButton(int button) {
-	switch (button) {
-		case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CROSS;
-		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
-		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
-		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
-		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
-		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
-		case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return Controller::PAD_BUTTON_L1;
-		case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return Controller::PAD_BUTTON_R1;
-		case SDL_CONTROLLER_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
-		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
-		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
-		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
-		default: return 0;
-	}
-}
-
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
 		case SDL_CONTROLLER_AXIS_LEFTX: return Controller::Axis::LeftX;
@@ -349,20 +329,28 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.added) {
 		auto* pad = SDL_GameControllerOpen(f.id);
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+		int         id   = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+		const char* name = SDL_GameControllerName(pad);
+		if (!Controller::ControllerNameAllowed(name)) {
+			LOGF("Controller \"%s\" (id %d) ignored by --controller\n",
+			     name != nullptr ? name : "unknown", id);
+			SDL_GameControllerClose(pad);
+			return;
+		}
+		LOGF("Controller \"%s\" connected (id %d)\n", name != nullptr ? name : "unknown", id);
 		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		Controller::Disconnect(f.id);
-		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
+		// Controllers excluded by --controller were never opened or connected.
+		if (auto* pad = SDL_GameControllerFromInstanceID(f.id); pad != nullptr) {
+			Controller::Disconnect(f.id);
+			SDL_GameControllerClose(pad);
+		}
 	}
 
 	if (f.down || f.up) {
-		const auto button = ControllerButtonToPadButton(f.button);
-		if (button != 0) {
-			Controller::SetButton(f.id, button, f.down);
-		}
+		HostInputControllerButton(f.id, f.button, f.down);
 	}
 
 	if (f.axis) {

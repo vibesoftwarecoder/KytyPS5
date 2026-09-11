@@ -77,6 +77,15 @@ static void PrintUsage() {
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
+	::printf("  --padmap <Control=Button>            Controller button mapping; may be repeated.\n"
+	         "                                       Buttons use SDL names: a, b, x, y, back,\n"
+	         "                                       guide, start, leftstick, rightstick,\n"
+	         "                                       leftshoulder, rightshoulder, dpup, dpdown,\n"
+	         "                                       dpleft, dpright, misc1, touchpad.\n");
+	::printf("  --controller <mode>                  Controller that drives the game: first (the\n"
+	         "                                       first to press a button; default), last (the\n"
+	         "                                       most recently used), or name:TEXT (only\n"
+	         "                                       controllers whose name contains TEXT).\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -314,6 +323,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.keymap.push_back(value);
+		} else if (arg == "--padmap") {
+			const auto split = value.find('=');
+			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
+				::printf("invalid padmap: %s\n", value.c_str());
+				return false;
+			}
+			options.config.padmap.push_back(value);
+		} else if (arg == "--controller") {
+			if (value != "first" && value != "last" &&
+			    !(Common::StartsWith(value, "name:") && value.size() > 5)) {
+				::printf("invalid controller selection: %s\n", value.c_str());
+				return false;
+			}
+			options.config.controller_selection = value;
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;

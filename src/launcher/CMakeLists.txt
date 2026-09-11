@@ -20,7 +20,10 @@ add_executable(launcher WIN32
 )
 
 
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers kyty_git_version)
+target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers kyty_git_version SDL2-static)
+# SDL lists and tests game controllers in the Controls dialog; the launcher keeps its own main().
+target_compile_definitions(launcher PRIVATE SDL_MAIN_HANDLED)
+target_include_directories(launcher PRIVATE "${KYTY_THIRD_PARTY_DIR}/SDL2/include")
 if(WIN32)
 target_link_libraries(launcher setupapi)
 endif()

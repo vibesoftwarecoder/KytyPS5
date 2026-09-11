@@ -2,6 +2,7 @@
 
 #include "SDL_error.h"
 #include "SDL_events.h"
+#include "SDL_gamecontroller.h"
 #include "SDL_keyboard.h"
 #include "SDL_keycode.h"
 #include "SDL_mouse.h"
@@ -150,8 +151,33 @@ public:
 			}
 			Add(binding);
 		}
+
+		m_pad_controls.fill(INVALID_CONTROL);
+		for (const auto& value: Config::GetPadmap()) {
+			const std::string_view entry   = value;
+			const auto             split   = entry.find('=');
+			std::size_t            control = INVALID_CONTROL;
+			auto                   button  = SDL_CONTROLLER_BUTTON_INVALID;
+			if (split != std::string_view::npos) {
+				control = ControlFromName(entry.substr(0, split));
+				button  = SDL_GameControllerGetButtonFromString(
+                    std::string(entry.substr(split + 1)).c_str());
+			}
+			if (control == INVALID_CONTROL || button == SDL_CONTROLLER_BUTTON_INVALID) {
+				EXIT("Invalid controller mapping: %s\n", value.c_str());
+			}
+			m_pad_controls[static_cast<std::size_t>(button)] = control;
+			m_pad_custom                                      = true;
+		}
 	}
-	[[nodiscard]] bool  Custom() const { return m_size != 0; }
+	[[nodiscard]] bool Custom() const { return m_size != 0; }
+	// A custom controller layout replaces the default one completely: unlisted buttons do nothing.
+	[[nodiscard]] bool        PadCustom() const { return m_pad_custom; }
+	[[nodiscard]] std::size_t FindPadButton(int sdl_button) const {
+		return sdl_button >= 0 && sdl_button < SDL_CONTROLLER_BUTTON_MAX
+		           ? m_pad_controls[static_cast<std::size_t>(sdl_button)]
+		           : INVALID_CONTROL;
+	}
 	[[nodiscard]] float MouseSensitivity() const { return m_mouse_sensitivity; }
 
 	[[nodiscard]] std::size_t FindKey(int key_code) const {
@@ -182,9 +208,11 @@ private:
 		m_bindings[m_size++] = binding;
 	}
 
-	std::array<Binding, CONTROL_INFO.size()> m_bindings {};
-	std::size_t                              m_size              = 0;
-	float                                    m_mouse_sensitivity = 1.0f;
+	std::array<Binding, CONTROL_INFO.size()>           m_bindings {};
+	std::size_t                                        m_size              = 0;
+	float                                              m_mouse_sensitivity = 1.0f;
+	std::array<std::size_t, SDL_CONTROLLER_BUTTON_MAX> m_pad_controls {};
+	bool                                               m_pad_custom = false;
 };
 
 const InputMap& GetInputMap() {
@@ -192,20 +220,51 @@ const InputMap& GetInputMap() {
 	return map;
 }
 
-void SetButton(uint32_t button, bool down) {
+void SetButton(int id, uint32_t button, bool down) {
 	if (button == Controller::PAD_BUTTON_L2) {
-		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerLeft,
-		                    down ? 255 : 0);
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
 	} else if (button == Controller::PAD_BUTTON_R2) {
-		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerRight,
-		                    down ? 255 : 0);
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
 	} else if (button != 0) {
-		Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, button, down);
+		Controller::SetButton(id, button, down);
+	}
+}
+
+void SetButton(uint32_t button, bool down) {
+	SetButton(Controller::HOST_INPUT_CONTROLLER_ID, button, down);
+}
+
+void SetTouchPad(int id, float x, bool down) {
+	Controller::SetTouchPad(id, 0, down, x, 0.5f);
+	if (id != Controller::HOST_INPUT_CONTROLLER_ID) {
+		// The controller layer sets the touch pad click bit itself only for keyboard touches.
+		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
 	}
 }
 
 void SetTouchPad(float x, bool down) {
-	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
+	SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, x, down);
+}
+
+// SDL's standard controller layout mapped onto the DualSense.
+uint32_t DefaultControllerButton(int sdl_button) {
+	switch (sdl_button) {
+		case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CROSS;
+		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
+		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
+		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
+		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
+		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
+		case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return Controller::PAD_BUTTON_L1;
+		case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return Controller::PAD_BUTTON_R1;
+		case SDL_CONTROLLER_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
+		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
+		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
+		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
+		default: return 0;
+	}
 }
 
 uint32_t DefaultKeyboardButton(int key_code) {
@@ -235,28 +294,33 @@ struct StickKeys {
 	bool down  = false;
 };
 
-void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
+void SetStickAxis(int id, Controller::Axis axis, bool negative, bool positive) {
 	int value = 128;
 	if (negative && !positive) {
 		value = 0;
 	} else if (positive && !negative) {
 		value = 255;
 	}
-	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
+	Controller::SetAxis(id, axis, value);
 }
 
-void SetControl(std::size_t control, bool down) {
+void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
+	SetStickAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, negative, positive);
+}
+
+// Applies a mapped control for `id`: the keyboard, or a controller with a custom layout.
+void SetControl(int id, std::size_t control, bool down) {
 	if (control == INVALID_CONTROL) {
 		return;
 	}
 
 	const auto& info = CONTROL_INFO[control];
 	if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
-		SetTouchPad(info.touch_x, down);
+		SetTouchPad(id, info.touch_x, down);
 		return;
 	}
 	if (info.button != 0) {
-		SetButton(info.button, down);
+		SetButton(id, info.button, down);
 		return;
 	}
 
@@ -264,7 +328,10 @@ void SetControl(std::size_t control, bool down) {
 		bool negative = false;
 		bool positive = false;
 	};
-	static std::array<AxisKeys, 4> axes;
+	// Buttons bound to stick directions, tracked separately for the keyboard and controllers.
+	static std::array<AxisKeys, 4> keyboard_axes;
+	static std::array<AxisKeys, 4> controller_axes;
+	auto& axes = id == Controller::HOST_INPUT_CONTROLLER_ID ? keyboard_axes : controller_axes;
 
 	const auto axis = static_cast<std::size_t>(info.axis);
 	EXIT_IF(axis >= axes.size());
@@ -273,7 +340,11 @@ void SetControl(std::size_t control, bool down) {
 	} else {
 		axes[axis].negative = down;
 	}
-	SetStickAxis(info.axis, axes[axis].negative, axes[axis].positive);
+	SetStickAxis(id, info.axis, axes[axis].negative, axes[axis].positive);
+}
+
+void SetControl(std::size_t control, bool down) {
+	SetControl(Controller::HOST_INPUT_CONTROLLER_ID, control, down);
 }
 
 void DefaultKeyboardInput(int key_code, bool down) {
@@ -364,6 +435,15 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
+	}
+}
+
+void HostInputControllerButton(int id, int sdl_button, bool down) {
+	const auto& map = GetInputMap();
+	if (map.PadCustom()) {
+		SetControl(id, map.FindPadButton(sdl_button), down);
+	} else {
+		SetButton(id, DefaultControllerButton(sdl_button), down);
 	}
 }
 

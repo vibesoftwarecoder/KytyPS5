@@ -13,7 +13,11 @@
 #include "libs/padData.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Controller {
@@ -91,9 +95,14 @@ struct ControllerState {
 
 class GameController {
 public:
-	GameController() = default;
+	// Which connected controller drives player 1; see --controller.
+	enum class Selection { First, Last, Name };
+
+	explicit GameController(const std::string& selection);
 
 	KYTY_CLASS_NO_COPY(GameController);
+
+	[[nodiscard]] bool NameAllowed(const char* name) const;
 
 	void Connect(int id);
 	void Disconnect(int id);
@@ -115,6 +124,8 @@ private:
 
 	void CheckActive();
 	void AddState();
+	bool Accept(int id, bool deliberate);
+	void SwitchActive(int id);
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -127,6 +138,8 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	Selection        m_selection     = Selection::First;
+	std::string      m_name_filter; // lower case, for Selection::Name
 };
 
 static GameController* g_controller = nullptr;
@@ -245,10 +258,65 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 	}
 }
 
+static std::string ToLower(std::string_view text) {
+	std::string result(text);
+	std::transform(result.begin(), result.end(), result.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return result;
+}
+
+GameController::GameController(const std::string& selection) {
+	if (selection == "last") {
+		m_selection = Selection::Last;
+	} else if (selection.rfind("name:", 0) == 0) {
+		m_selection   = Selection::Name;
+		m_name_filter = ToLower(std::string_view(selection).substr(5));
+	}
+}
+
+bool GameController::NameAllowed(const char* name) const {
+	if (m_selection != Selection::Name) {
+		return true;
+	}
+	return name != nullptr && ToLower(name).find(m_name_filter) != std::string::npos;
+}
+
+// Keyboard input always drives player 1. A controller claims player 1 with deliberate input (a
+// button press, or a stick or trigger pushed well past its dead zone): in "first" and "name" mode
+// only while no controller holds player 1, in "last" mode whenever it is used.
+bool GameController::Accept(int id, bool deliberate) {
+	if (id == HOST_INPUT_CONTROLLER_ID || id == m_active_id) {
+		return true;
+	}
+	if (!deliberate ||
+	    std::find(m_connected_ids.begin(), m_connected_ids.end(), id) == m_connected_ids.end()) {
+		return false;
+	}
+	const bool pad_holds_player = m_active_id >= 0;
+	if (pad_holds_player && m_selection != Selection::Last) {
+		return false;
+	}
+	SwitchActive(id);
+	return true;
+}
+
+void GameController::SwitchActive(int id) {
+	auto*       pad  = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
+	const char* name = pad != nullptr ? SDL_GameControllerName(pad) : nullptr;
+	LOGF("Controller: player 1 is now \"%s\" (id %d)\n", name != nullptr ? name : "unknown", id);
+
+	m_active_id     = id;
+	m_state         = {};
+	m_state.time    = LibKernel::KernelGetProcessTime();
+	m_states_num    = 0;
+	m_first_state   = 0;
+	m_next_touch_id = 1;
+}
+
 void Initialize() {
 	EXIT_IF(g_controller != nullptr);
 
-	g_controller = new GameController;
+	g_controller = new GameController(Config::GetControllerSelection());
 	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
 }
 
@@ -288,18 +356,17 @@ void GameController::Disconnect(int id) {
 }
 
 void GameController::CheckActive() {
-	int  new_active_id = -1;
-	bool new_connected = false;
+	const bool new_connected = !m_connected_ids.empty();
+	int        new_active_id = m_active_id;
 
-	if (!m_connected_ids.empty()) {
-		new_active_id = m_connected_ids[0];
-		for (const auto id: m_connected_ids) {
-			if (id != HOST_INPUT_CONTROLLER_ID) {
-				new_active_id = id;
-				break;
-			}
+	// Keep the controller that holds player 1 while it stays connected. Otherwise fall back to the
+	// keyboard until a controller claims player 1 (see Accept).
+	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), m_active_id) ==
+	    m_connected_ids.end()) {
+		new_active_id = new_connected ? m_connected_ids[0] : -1;
+		if (m_active_id >= 0) {
+			LOGF("Controller: player 1's controller (id %d) disconnected\n", m_active_id);
 		}
-		new_connected = true;
 	}
 
 	if (m_connected == new_connected && m_active_id == new_active_id) {
@@ -331,8 +398,8 @@ void GameController::AddState() {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
-	// The keyboard shares the player-1 pad with the active gamepad.
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	// The keyboard shares the player-1 pad with the controller that holds player 1.
+	if (Accept(id, down)) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
@@ -344,7 +411,10 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	const bool is_trigger =
+	    axis == Controller::Axis::TriggerLeft || axis == Controller::Axis::TriggerRight;
+	const bool deliberate = is_trigger ? value > 191 : std::abs(value - 128) > 96;
+	if (Accept(id, deliberate)) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
@@ -562,6 +632,10 @@ void Connect(int id) {
 
 void Disconnect(int id) {
 	g_controller->Disconnect(id);
+}
+
+bool ControllerNameAllowed(const char* name) {
+	return g_controller->NameAllowed(name);
 }
 
 void SetButton(int id, uint32_t button, bool down) {

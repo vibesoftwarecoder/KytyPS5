@@ -3,6 +3,10 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+
+#include <chrono>
+#include <cstdio>
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -76,11 +80,32 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::PrepareBda() {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	const auto began = std::chrono::steady_clock::now();
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+	}
 	m_fault_process_pending = true;
+
+	// Local instrumentation: this runs for every dispatch and walks every mapped range.
+	static uint64_t calls   = 0;
+	static double   busy_ms = 0.0;
+	static auto     since   = began;
+	const auto      now     = std::chrono::steady_clock::now();
+	calls++;
+	busy_ms += std::chrono::duration<double, std::milli>(now - began).count();
+	const auto seconds = std::chrono::duration<double>(now - since).count();
+	if (seconds >= 2.0) {
+		// printf, not LOGF: LOGF is silent under the launcher's default --printf-direction.
+		std::printf("PrepareBda: %.0f calls/s, %.0f ms/s\n", static_cast<double>(calls) / seconds,
+		            busy_ms / seconds);
+		std::fflush(stdout);
+		calls   = 0;
+		busy_ms = 0.0;
+		since   = now;
+	}
 }
 
 void GpuResourceManager::RunGarbageCollector() {

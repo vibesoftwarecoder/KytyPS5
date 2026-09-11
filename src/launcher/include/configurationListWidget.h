@@ -42,6 +42,12 @@ public:
 	[[nodiscard]] const QStringList& GetHostInputMapping() const {
 		return m_global_info.host_input_mapping;
 	}
+	[[nodiscard]] const QStringList& GetControllerMapping() const {
+		return m_global_info.controller_mapping;
+	}
+	[[nodiscard]] const QString& GetControllerSelection() const {
+		return m_global_info.controller_selection;
+	}
 	[[nodiscard]] bool CanViewSelectedTrophies() const;
 
 	bool EnsureGameDirectory();

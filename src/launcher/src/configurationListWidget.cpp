@@ -203,7 +203,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 
 	UpdateToolbarIcons();
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
-	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
+	m_ui->input_mapping_button->setToolTip(tr("Controls: controller and keyboard"));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
@@ -718,9 +718,12 @@ void ConfigurationListWidget::edit_global_settings() {
 }
 
 void ConfigurationListWidget::edit_input_mapping() {
-	InputMappingDialog dialog(m_global_info.host_input_mapping, this);
+	InputMappingDialog dialog(m_global_info.host_input_mapping, m_global_info.controller_mapping,
+	                          m_global_info.controller_selection, this);
 	if (dialog.exec() == QDialog::Accepted) {
-		m_global_info.host_input_mapping = dialog.Mapping();
+		m_global_info.host_input_mapping   = dialog.Mapping();
+		m_global_info.controller_mapping   = dialog.ControllerMapping();
+		m_global_info.controller_selection = dialog.ControllerSelection();
 		WriteSettings();
 	}
 }
