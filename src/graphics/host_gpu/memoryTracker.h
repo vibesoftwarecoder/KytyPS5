@@ -29,6 +29,12 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Advances after pages become CPU-modified, including every page of a newly created region.
+	// It advances after the state change, so a caller that reads it, then uploads every
+	// CPU-modified range, can skip its next pass while the value is unchanged.
+	[[nodiscard]] uint64_t CpuModifiedGeneration() const noexcept {
+		return m_cpu_modified_generation.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -51,6 +57,7 @@ public:
 				on_flush();
 			}
 		});
+		BumpCpuModified();
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -139,6 +146,10 @@ private:
 		}
 	}
 
+	void BumpCpuModified() noexcept {
+		m_cpu_modified_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
 		ValidateRange(vaddr, size);
@@ -176,6 +187,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint64_t>                          m_cpu_modified_generation {0};
 };
 
 } // namespace Libs::Graphics

@@ -111,24 +111,49 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
+// Local instrumentation: hash of the register inputs of one materialization. Equal user data and
+// shader base are necessary, not sufficient, for an equal result: guest memory is read as well.
+uint64_t HashMaterializeInputs(std::span<const uint32_t> user_data, uint64_t shader_base) {
+	uint64_t hash = 0xcbf29ce484222325ull ^ shader_base;
+	for (const auto word: user_data) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+		hash ^= hash >> 29u;
+	}
+	return hash ^ (static_cast<uint64_t>(user_data.size()) << 56u);
+}
+
 // Local instrumentation: per-draw resource materialization on a cached program, per thread.
-void CountMaterialize(std::chrono::steady_clock::duration elapsed) {
-	thread_local uint64_t                            calls = 0;
+// repeat_last: the same program's previous materialization had the same register inputs.
+// repeat_recent: one of its last eight did.
+void CountMaterialize(std::chrono::steady_clock::duration elapsed, bool repeat_last,
+                      bool repeat_recent) {
+	thread_local uint64_t                            calls         = 0;
+	thread_local uint64_t                            repeat_lasts  = 0;
+	thread_local uint64_t                            repeat_recents = 0;
 	thread_local std::chrono::steady_clock::duration total {};
 	thread_local auto                                since = std::chrono::steady_clock::now();
 	calls++;
+	repeat_lasts += repeat_last ? 1u : 0u;
+	repeat_recents += repeat_recent ? 1u : 0u;
 	total += elapsed;
 	const auto now     = std::chrono::steady_clock::now();
 	const auto seconds = std::chrono::duration<double>(now - since).count();
 	if (seconds >= 2.0) {
-		const auto ms = std::chrono::duration<double, std::milli>(total).count();
-		std::printf("Materialize: %.0f calls/s, %.0f ms/s (avg %.1f us)\n",
+		const auto ms  = std::chrono::duration<double, std::milli>(total).count();
+		const auto pct = [&](uint64_t count) {
+			return calls == 0 ? 0.0 : 100.0 * static_cast<double>(count) / static_cast<double>(calls);
+		};
+		std::printf("Materialize: %.0f calls/s, %.0f ms/s (avg %.1f us) | same inputs as the "
+		            "program's last call %.0f%%, as one of its last 8 %.0f%%\n",
 		            static_cast<double>(calls) / seconds, ms / seconds,
-		            calls == 0 ? 0.0 : ms * 1000.0 / static_cast<double>(calls));
+		            calls == 0 ? 0.0 : ms * 1000.0 / static_cast<double>(calls), pct(repeat_lasts),
+		            pct(repeat_recents));
 		std::fflush(stdout);
-		calls = 0;
-		total = {};
-		since = now;
+		calls          = 0;
+		repeat_lasts   = 0;
+		repeat_recents = 0;
+		total          = {};
+		since          = now;
 	}
 }
 
@@ -251,6 +276,9 @@ struct PipelineCache::ProgramCache {
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
+		// Local instrumentation: input hashes of this program's recent materializations.
+		std::array<uint64_t, 8> recent_inputs {};
+		uint32_t                recent_next = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -359,7 +387,14 @@ struct PipelineCache::ProgramCache {
 			const auto materialize_start = std::chrono::steady_clock::now();
 			const bool materialized      = ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, resources, specialization, &report);
-			CountMaterialize(std::chrono::steady_clock::now() - materialize_start);
+			const auto materialize_time = std::chrono::steady_clock::now() - materialize_start;
+			auto&      recent           = entry->second.recent_inputs;
+			const auto inputs = HashMaterializeInputs(params.user_data, params.Base());
+			const auto last   = recent[(entry->second.recent_next + recent.size() - 1) % recent.size()];
+			const bool repeat_recent = std::ranges::find(recent, inputs) != recent.end();
+			recent[entry->second.recent_next] = inputs;
+			entry->second.recent_next = (entry->second.recent_next + 1) % recent.size();
+			CountMaterialize(materialize_time, last == inputs, repeat_recent);
 			ReportMaterialization(label, stage, params.hash, report, materialized);
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {

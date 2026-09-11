@@ -38,10 +38,21 @@ private:
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
+	struct BdaSyncState {
+		uint64_t cpu_modified = 0;
+		uint64_t buffer_set   = 0;
+		uint64_t mapped       = 0;
+
+		bool operator==(const BdaSyncState&) const = default;
+	};
+
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	uint64_t                  m_mapped_generation = 0; // guarded by m_mapped_ranges_mutex
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
+	bool                      m_bda_synced            = false;
+	BdaSyncState              m_bda_state;
 };
 
 } // namespace Libs::Graphics

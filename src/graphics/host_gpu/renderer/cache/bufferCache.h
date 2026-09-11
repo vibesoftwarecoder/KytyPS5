@@ -69,6 +69,12 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Together these change whenever SynchronizeBuffersInRange could find new work: a page became
+	// CPU-modified, or a buffer was registered or unregistered (GPU thread).
+	[[nodiscard]] uint64_t CpuModifiedGeneration() const noexcept {
+		return m_memory_tracker.CpuModifiedGeneration();
+	}
+	[[nodiscard]] uint64_t BufferSetGeneration() const noexcept { return m_buffer_set_generation; }
 	void               RunGarbageCollector();
 
 private:
@@ -129,6 +135,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	uint64_t m_buffer_set_generation = 0;
 };
 
 } // namespace Libs::Graphics

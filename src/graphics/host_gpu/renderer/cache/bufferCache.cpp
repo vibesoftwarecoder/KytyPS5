@@ -136,6 +136,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
+	m_buffer_set_generation++;
 	if constexpr (insert) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
