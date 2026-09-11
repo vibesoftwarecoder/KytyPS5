@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
+#include "common/localToggles.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -401,7 +402,8 @@ std::optional<uint64_t> BufferCache::GpuWriteTick(uint64_t vaddr, uint64_t size)
 // Adapted from brandostrong's 283c293 (frangametv/KytyPS5), which also barriered on all commands.
 bool BufferCache::TryDownloadRetired(std::span<const DownloadCopy> copies) {
 	KYTY_PROFILER_FUNCTION();
-	if (copies.empty()) {
+	static const bool disabled = Common::LocalFeatureDisabled("retired");
+	if (copies.empty() || disabled) {
 		return false;
 	}
 	uint64_t write_tick  = 0;

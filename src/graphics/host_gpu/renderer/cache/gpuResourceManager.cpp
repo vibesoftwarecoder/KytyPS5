@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/localToggles.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
@@ -95,7 +96,8 @@ void GpuResourceManager::PrepareBda() {
 		    .buffer_set   = m_buffer_cache.BufferSetGeneration(),
 		    .mapped       = m_mapped_generation,
 		};
-		if (m_bda_synced && state == m_bda_state) {
+		static const bool skip_disabled = Common::LocalFeatureDisabled("bdaskip");
+		if (m_bda_synced && state == m_bda_state && !skip_disabled) {
 			skipped = true;
 		} else {
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/localToggles.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -600,6 +601,22 @@ struct EvalTimer {
 	std::chrono::steady_clock::time_point start;
 };
 
+// Local run-time switches (KYTY_LOCAL_DISABLE), read once.
+bool LineCacheDisabled() {
+	static const bool disabled = Common::LocalFeatureDisabled("linecache");
+	return disabled;
+}
+
+bool DenseSlotsDisabled() {
+	static const bool disabled = Common::LocalFeatureDisabled("denseslots");
+	return disabled;
+}
+
+bool CleanReadDisabled() {
+	static const bool disabled = Common::LocalFeatureDisabled("cleanread");
+	return disabled;
+}
+
 // Values one evaluator has computed, keyed by instruction. Storage is recycled per thread: a draw
 // evaluates a few hundred values, and a node-based map allocated and freed each one on every draw.
 // Entries left by earlier evaluators are told apart by generation instead of being cleared.
@@ -795,7 +812,8 @@ private:
 class CleanLineCache {
 public:
 	explicit CleanLineCache(const SrtRuntime& runtime)
-	    : m_read_block(runtime.read_clean_block), m_userdata(runtime.userdata) {}
+	    : m_read_block(LineCacheDisabled() ? nullptr : runtime.read_clean_block),
+	      m_userdata(runtime.userdata) {}
 
 	// True with the word when its whole line is clean; false when the caller must use the word
 	// reader.
@@ -892,7 +910,8 @@ private:
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto slot = inst->GetEvalSlot(); slot < m_program.eval_slot_count) {
+		if (const auto slot = inst->GetEvalSlot();
+		    slot < m_program.eval_slot_count && !DenseSlotsDisabled()) {
 			return EvaluateMemoized(m_dense, slot, *inst, result);
 		}
 		return EvaluateMemoized(m_memo, static_cast<const Inst*>(inst), *inst, result);
@@ -1034,7 +1053,7 @@ private:
 			if (!ReadWith(m_runtime.read_memory, address, word)) {
 				return false;
 			}
-		} else if (m_runtime.read_clean_memory == nullptr ||
+		} else if (m_runtime.read_clean_memory == nullptr || CleanReadDisabled() ||
 		           !ReadWith(m_runtime.read_clean_memory, address, word)) {
 			// An ordinary read is direct. A clean reader, when the runtime has one, returns the same
 			// bytes without faulting when the GPU did not write them; a fault here drains the whole
