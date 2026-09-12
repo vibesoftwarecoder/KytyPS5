@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/localToggles.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -10,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/indirectArgsTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1173,6 +1175,18 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
+	// The GPU reads these arguments itself (renderCompute.cpp records vkCmdDispatchIndirect), so
+	// reading them here only forces a drain when a compute shader just wrote them. The values are
+	// needed on the CPU only for thread-dimension dispatches, whose counts become shader inputs.
+	// Each dispatch is traced (indirectArgsTrace.h) so a lost device shows what preceded it.
+	static const bool always_read = Common::LocalFeatureDisabled("dispatchargs");
+	const bool        skip        = !DispatchUsesThreadDimensions(mode) && !always_read;
+	IndirectArgsTrace::Begin(args_addr, 0, skip, m_submit_id);
+	if (skip) {
+		DispatchDirect(0, 0, 0, mode, args_addr);
+		return;
+	}
+
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
 		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {

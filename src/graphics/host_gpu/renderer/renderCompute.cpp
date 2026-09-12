@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/indirectArgsTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -309,7 +310,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
@@ -331,7 +331,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions = DispatchUsesThreadDimensions(mode);
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
@@ -490,8 +490,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (indirect_args != 0) {
-		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
+		auto& args_cache = m_context.GetBufferCache();
+		auto* trace      = IndirectArgsTrace::g_current;
+		if (trace != nullptr) {
+			trace->gpu_dirty = args_cache.IsRegionGpuModified(indirect_args, 3u * sizeof(uint32_t));
+			trace->cpu_dirty = args_cache.IsRegionCpuModified(indirect_args, 3u * sizeof(uint32_t));
+		}
+		auto [args_buffer, args_offset] =
+		    args_cache.ObtainBuffer(indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
+		if (trace != nullptr) {
+			trace->stream = args_buffer == &args_cache.GetUtilityBuffer(MemoryUsage::Stream);
+			trace->buffer = trace->stream ? 0 : args_buffer->CpuAddress();
+			IndirectArgsTrace::g_current = nullptr;
+		}
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |

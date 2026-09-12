@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <optional>
+#include "graphics/host_gpu/renderer/indirectArgsTrace.h"
 
 namespace Libs::Graphics {
 
@@ -26,6 +27,8 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	// Local diagnostics: a lost device shows the indirect dispatches that preceded it.
+	IndirectArgsTrace::Dump();
 }
 
 } // namespace

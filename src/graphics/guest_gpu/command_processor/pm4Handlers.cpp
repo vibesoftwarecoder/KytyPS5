@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/localToggles.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -6,6 +7,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/indirectArgsTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1341,6 +1343,15 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		uint32_t   mode      = buffer[2];
 
 		EXIT_NOT_IMPLEMENTED(args_addr == 0);
+		// As in CommandProcessor::DispatchIndirect: the GPU reads these arguments itself, so read
+		// them here only for thread-dimension dispatches, which consume the counts as shader inputs.
+		static const bool always_read = Common::LocalFeatureDisabled("dispatchargs");
+		const bool        skip        = !DispatchUsesThreadDimensions(mode) && !always_read;
+		IndirectArgsTrace::Begin(args_addr, 1, skip, 0);
+		if (skip) {
+			cp.DispatchDirect(0, 0, 0, mode, args_addr);
+			return 3;
+		}
 		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
 			static std::atomic<uint32_t> sync_fallback_logs {0};
 			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {

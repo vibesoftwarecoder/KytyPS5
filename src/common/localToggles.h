@@ -11,7 +11,7 @@ namespace Common {
 // Local only. KYTY_LOCAL_DISABLE is a comma-separated list of local performance changes to turn
 // off at run time, so a regression can be bisected with a relaunch instead of a rebuild (a rebuild
 // also resets the pipeline cache). Names: retired, bdaskip, linecache, denseslots, cleanread,
-// matreuse, srtcompile, buffersync.
+// matreuse, srtcompile, buffersync, dispatchargs.
 // The value is read once and printed, so the log records what a run actually had.
 inline bool LocalFeatureDisabled(std::string_view name) {
 	static const std::string list = [] {
