@@ -314,7 +314,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		void StoreReusable(std::span<const uint32_t> user_data, uint64_t shader_base,
-		                   std::vector<std::pair<uint64_t, uint32_t>>&&      reads,
+		                   std::span<const std::pair<uint64_t, uint32_t>>      reads,
 		                   const ShaderRecompiler::IR::ResourceSnapshot&       resources,
 		                   const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
 			ReusableResult* slot = nullptr;
@@ -329,9 +329,11 @@ struct PipelineCache::ProgramCache {
 				slot          = &reusable[reusable_next];
 				reusable_next = (reusable_next + 1) % reusable.size();
 			}
+			// assign, not move: the slot keeps the memory it already had, so a steady state of
+			// draws stores results without allocating.
 			slot->user_data.assign(user_data.begin(), user_data.end());
-			slot->shader_base    = shader_base;
-			slot->reads          = std::move(reads);
+			slot->shader_base = shader_base;
+			slot->reads.assign(reads.begin(), reads.end());
 			slot->resources      = resources;
 			slot->specialization = specialization;
 			slot->valid          = true;
@@ -471,15 +473,19 @@ struct PipelineCache::ProgramCache {
 				materialized = reuse == ReuseOutcome::Reused;
 			}
 			if (!materialized) {
-				ShaderRecompiler::IR::SrtReadLog log;
-				auto                             logged = runtime;
-				logged.read_log                         = reuse_disabled ? nullptr : &log;
-				materialized = ShaderRecompiler::IR::MaterializeResources(
+				// One log per thread, reused. A fresh vector per call grew from empty on every
+				// draw, and those allocations cost more than the reuse saved.
+				thread_local ShaderRecompiler::IR::SrtReadLog log;
+				log.words.clear();
+				log.reusable    = true;
+				auto logged     = runtime;
+				logged.read_log = reuse_disabled ? nullptr : &log;
+				materialized    = ShaderRecompiler::IR::MaterializeResources(
 				    source.resource_plan, logged, resources, specialization, &report);
 				if (materialized && !reuse_disabled) {
 					if (log.reusable) {
-						source.StoreReusable(params.user_data, params.Base(), std::move(log.words),
-						                     resources, specialization);
+						source.StoreReusable(params.user_data, params.Base(), log.words, resources,
+						                     specialization);
 					} else {
 						not_reusable = true;
 					}
