@@ -110,6 +110,9 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// The checks of TryReadGpuCleanBacking without the read: true when a plain TryReadBacking of any
+// part of the range returns the same bytes the GPU would see. GPU thread only for GPU memory.
+bool                   IsGpuCleanRange(uint64_t vaddr, uint64_t size);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

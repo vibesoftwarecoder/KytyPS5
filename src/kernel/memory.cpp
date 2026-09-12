@@ -869,15 +869,17 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
-			return false;
-		}
+bool IsGpuCleanRange(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
 	}
-	return TryReadBacking(vaddr, data, size);
+	return Graphics::GuestGpu::IsGpuThread() &&
+	       !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return IsGpuCleanRange(vaddr, size) && TryReadBacking(vaddr, data, size);
 }
 
 // Local instrumentation: explicit syncs that force a readback (GPU thread only). Small ones are

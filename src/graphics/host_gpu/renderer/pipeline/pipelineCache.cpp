@@ -109,6 +109,16 @@ bool ReadShaderGuestMemoryBlock(void*, uint64_t address, void* data, uint64_t si
 	return data != nullptr && Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
 }
 
+// The clean check and the plain read separately, so the evaluator can judge a page once and read
+// its lines without repeating the check.
+bool IsShaderGuestMemoryClean(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::IsGpuCleanRange(address, size);
+}
+
+bool ReadShaderGuestMemoryUnchecked(void*, uint64_t address, void* data, uint64_t size) {
+	return data != nullptr && Libs::LibKernel::Memory::TryReadBacking(address, data, size);
+}
+
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
@@ -457,6 +467,8 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .read_clean_memory          = ReadShaderGuestMemory,
 		    .read_clean_block           = ReadShaderGuestMemoryBlock,
+		    .is_clean_memory            = IsShaderGuestMemoryClean,
+		    .read_unchecked_block       = ReadShaderGuestMemoryUnchecked,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;

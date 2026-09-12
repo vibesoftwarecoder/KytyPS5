@@ -37,6 +37,11 @@ struct SrtRuntime {
 	SrtMemoryReader           read_clean_memory          = nullptr;
 	// Optional bulk form of read_clean_memory; it fails when any byte of the range would fail.
 	SrtMemoryBlockReader      read_clean_block           = nullptr;
+	// Optional pair that splits read_clean_block into its verdict and its read, so one verdict
+	// can cover a whole page of lines: is_clean_memory answers whether read_unchecked_block would
+	// return the bytes the GPU sees for any part of the range.
+	SrtMemorySync             is_clean_memory            = nullptr;
+	SrtMemoryBlockReader      read_unchecked_block       = nullptr;
 	SrtMemorySync             sync_memory                = nullptr;
 	// Optional: every guest word read is recorded here (see SrtReadLog).
 	SrtReadLog*               read_log                   = nullptr;

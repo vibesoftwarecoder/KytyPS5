@@ -553,6 +553,8 @@ struct EvalStats {
 	std::atomic<uint64_t> line_served {0};
 	std::atomic<uint64_t> line_reads {0};
 	std::atomic<uint64_t> line_failures {0};
+	std::atomic<uint64_t> page_checks {0};
+	std::atomic<uint64_t> page_clean {0};
 };
 
 EvalStats            g_eval_stats;
@@ -579,11 +581,14 @@ void ReportEvalStats() {
 	const auto line_served   = take(g_eval_stats.line_served);
 	const auto line_reads    = take(g_eval_stats.line_reads);
 	const auto line_failures = take(g_eval_stats.line_failures);
+	const auto page_checks   = take(g_eval_stats.page_checks);
+	const auto page_clean    = take(g_eval_stats.page_clean);
 	std::printf("SRT eval: %.0f calls/s, %.0f ms/s (avg %.1f us) | clean reads %.0f/s, %.0f%% from lines, "
-	            "%.0f line reads/s, %.0f failed lines/s\n",
+	            "%.0f line reads/s, %.0f failed lines/s, %.0f page checks/s (%.0f%% clean)\n",
 	            calls / seconds, nanoseconds / 1e6 / seconds, calls == 0 ? 0.0 : nanoseconds / 1e3 / calls,
 	            clean_reads / seconds, clean_reads == 0 ? 0.0 : 100.0 * line_served / clean_reads,
-	            line_reads / seconds, line_failures / seconds);
+	            line_reads / seconds, line_failures / seconds, page_checks / seconds,
+	            page_checks == 0 ? 0.0 : 100.0 * page_clean / page_checks);
 	std::fflush(stdout);
 }
 
@@ -1042,6 +1047,11 @@ bool CleanReadDisabled() {
 	return disabled;
 }
 
+bool PageCleanDisabled() {
+	static const bool disabled = Common::LocalFeatureDisabled("pageclean");
+	return disabled;
+}
+
 // Values one evaluator has computed, keyed by instruction. Storage is recycled per thread: a draw
 // evaluates a few hundred values, and a node-based map allocated and freed each one on every draw.
 // Entries left by earlier evaluators are told apart by generation instead of being cleared.
@@ -1238,6 +1248,8 @@ class CleanLineCache {
 public:
 	explicit CleanLineCache(const SrtRuntime& runtime)
 	    : m_read_block(LineCacheDisabled() ? nullptr : runtime.read_clean_block),
+	      m_is_clean(PageCleanDisabled() ? nullptr : runtime.is_clean_memory),
+	      m_read_unchecked(PageCleanDisabled() ? nullptr : runtime.read_unchecked_block),
 	      m_userdata(runtime.userdata) {}
 
 	// True with the word when its whole line is clean; false when the caller must use the word
@@ -1255,13 +1267,16 @@ public:
 			}
 		}
 		if (line == nullptr) {
-			line        = &m_lines[m_next];
-			m_next      = (m_next + 1) % m_lines.size();
-			line->base  = base;
-			line->state = m_read_block(m_userdata, base, line->bytes.data(), LINE_BYTES)
-			                  ? LineState::Clean
-			                  : LineState::Failed;
-			(line->state == LineState::Clean ? g_eval_stats.line_reads : g_eval_stats.line_failures)
+			line       = &m_lines[m_next];
+			m_next     = (m_next + 1) % m_lines.size();
+			line->base = base;
+			// A line in a page this evaluation already judged clean needs only the read; the
+			// verdict costs one dirty check per page instead of one per line.
+			const bool read = PageIsClean(base)
+			                      ? m_read_unchecked(m_userdata, base, line->bytes.data(), LINE_BYTES)
+			                      : m_read_block(m_userdata, base, line->bytes.data(), LINE_BYTES);
+			line->state     = read ? LineState::Clean : LineState::Failed;
+			(read ? g_eval_stats.line_reads : g_eval_stats.line_failures)
 			    .fetch_add(1, std::memory_order_relaxed);
 		}
 		if (line->state != LineState::Clean) {
@@ -1274,6 +1289,8 @@ public:
 private:
 	static constexpr uint64_t LINE_BYTES = 128;
 	static constexpr size_t   LINES      = 8;
+	static constexpr uint64_t PAGE_BYTES = 4096;
+	static constexpr size_t   PAGES      = 8;
 
 	enum class LineState : uint8_t { Empty, Clean, Failed };
 
@@ -1283,10 +1300,44 @@ private:
 		std::array<uint8_t, LINE_BYTES> bytes;
 	};
 
-	SrtMemoryBlockReader     m_read_block = nullptr;
-	void*                    m_userdata   = nullptr;
+	struct Page {
+		uint64_t page  = 0;
+		bool     valid = false;
+		bool     clean = false;
+	};
+
+	// Whether the page holding address was clean when first asked during this evaluation. A page
+	// that is not clean as a whole may still have clean lines; those keep the per-line check.
+	bool PageIsClean(uint64_t address) {
+		if (m_is_clean == nullptr || m_read_unchecked == nullptr) {
+			return false;
+		}
+		const auto page = address & ~(PAGE_BYTES - 1u);
+		for (const auto& entry: m_pages) {
+			if (entry.valid && entry.page == page) {
+				return entry.clean;
+			}
+		}
+		auto& entry = m_pages[m_next_page];
+		m_next_page = (m_next_page + 1) % m_pages.size();
+		entry.valid = true;
+		entry.page  = page;
+		entry.clean = m_is_clean(m_userdata, page, PAGE_BYTES);
+		g_eval_stats.page_checks.fetch_add(1, std::memory_order_relaxed);
+		if (entry.clean) {
+			g_eval_stats.page_clean.fetch_add(1, std::memory_order_relaxed);
+		}
+		return entry.clean;
+	}
+
+	SrtMemoryBlockReader     m_read_block     = nullptr;
+	SrtMemorySync            m_is_clean       = nullptr;
+	SrtMemoryBlockReader     m_read_unchecked = nullptr;
+	void*                    m_userdata       = nullptr;
 	std::array<Line, LINES>  m_lines;
 	size_t                   m_next = 0;
+	std::array<Page, PAGES>  m_pages;
+	size_t                   m_next_page = 0;
 };
 
 class Evaluator {
