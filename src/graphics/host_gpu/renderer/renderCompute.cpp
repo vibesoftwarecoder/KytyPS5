@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/localToggles.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -28,7 +29,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -525,6 +528,40 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+
+	// Bound how much compute one submission holds. Reading indirect arguments on the CPU used to
+	// force a submission before every such dispatch; without it, a loading phase with no frame
+	// flips recorded thousands of dispatches into one submission, which then ran past the host's
+	// GPU timeout (2 s on Windows) and lost the device. A flush submits without waiting, so this
+	// only shortens submissions; ordering on the queue is unchanged.
+	static const bool flush_disabled = Common::LocalFeatureDisabled("dispatchflush");
+	if (!flush_disabled) {
+		auto&      scheduler = m_context.GetCommandScheduler();
+		const auto tick      = scheduler.CurrentTick();
+		if (tick != m_dispatch_batch_tick) {
+			// Something else submitted since the last count; the batch starts over.
+			m_dispatch_batch_tick = tick;
+			m_dispatches_in_batch = 0;
+		}
+		if (++m_dispatches_in_batch >= DispatchesPerSubmission) {
+			scheduler.Flush();
+			m_dispatch_batch_tick = scheduler.CurrentTick();
+			m_dispatches_in_batch = 0;
+
+			// Local instrumentation.
+			static uint64_t flushes = 0;
+			static auto     since   = std::chrono::steady_clock::now();
+			flushes++;
+			const auto now     = std::chrono::steady_clock::now();
+			const auto seconds = std::chrono::duration<double>(now - since).count();
+			if (seconds >= 2.0) {
+				std::printf("Dispatch flushes: %.0f/s\n", static_cast<double>(flushes) / seconds);
+				std::fflush(stdout);
+				flushes = 0;
+				since   = now;
+			}
+		}
+	}
 }
 
 } // namespace Libs::Graphics

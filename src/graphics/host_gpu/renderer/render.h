@@ -227,6 +227,11 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Dispatches recorded into the submission that began at m_dispatch_batch_tick; at
+	// DispatchesPerSubmission the scheduler is flushed so no submission grows unbounded.
+	static constexpr uint32_t DispatchesPerSubmission = 64;
+	uint64_t                  m_dispatch_batch_tick  = 0;
+	uint32_t                  m_dispatches_in_batch  = 0;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
