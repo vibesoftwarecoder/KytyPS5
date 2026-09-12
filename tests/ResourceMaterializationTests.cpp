@@ -195,6 +195,32 @@ void TestReadLogVerifiesReuse() {
         "changed memory passed verification");
 }
 
+// The first materialization of a plan compiles its value graph and cross-checks the compiled
+// result against the recursive walk; later ones run the compiled steps. All of them must agree
+// with the guest memory as it stands at the time.
+void TestCompiledEvaluationMatches() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t dword = 0x12345678;
+  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  const SrtRuntime runtime{.read_specialization_memory = ReadTestWord,
+                           .read_clean_memory = ReadTestWord};
+  for (uint32_t run = 0; run < 3; run++) {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "materialization with the compiled walk failed");
+    Check(snapshot.flattened_srt.size() == 1 && snapshot.flattened_srt[0] == dword,
+          "the compiled walk returned the wrong SRT word");
+  }
+  dword = 0x0badc0de;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "materialization after a memory change failed");
+  Check(snapshot.flattened_srt.size() == 1 && snapshot.flattened_srt[0] == dword,
+        "the compiled walk kept a stale SRT word");
+}
+
 void TestFailedReadIsNotReusable() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -324,6 +350,7 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestReadLogVerifiesReuse();
+  TestCompiledEvaluationMatches();
   TestFailedReadIsNotReusable();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();

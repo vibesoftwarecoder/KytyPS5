@@ -514,6 +514,8 @@ struct UniformFillPlan {
 
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
+struct CompiledSrt;
+
 struct ResourcePlan {
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -537,6 +539,11 @@ struct ResourcePlan {
 	// Values in value_storage carry eval slots 0..eval_slot_count-1 (Inst::GetEvalSlot).
 	// 0 for a Program, whose instructions are not numbered.
 	uint32_t                            eval_slot_count                = 0;
+	// Flat evaluation for this plan, built on first use (SrtWalker.cpp). Null when the graph
+	// cannot be compiled, and retired if a cross-check ever disagrees with the recursive walk.
+	mutable std::shared_ptr<CompiledSrt> compiled_srt;
+	mutable bool                         compiled_srt_attempted   = false;
+	mutable uint32_t                     compiled_srt_verify_left = 32;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
