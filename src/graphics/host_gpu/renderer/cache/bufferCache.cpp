@@ -825,7 +825,26 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		buffer = &m_slot_buffers[id];
 	}
 	TouchBuffer(*buffer);
-	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	// Uploading walks the memory tracker for CPU-written pages. When this exact range was uploaded
+	// already and no page anywhere has become CPU-modified since, the walk can only find nothing.
+	// Written and texel obtains still go through: they also change tracker state.
+	static const bool skip_disabled = Common::LocalFeatureDisabled("buffersync");
+	const auto        generation    = m_memory_tracker.CpuModifiedGeneration();
+	const bool        already_synced = !is_written && !is_texel_buffer && !skip_disabled &&
+	                            buffer->sync_generation == generation &&
+	                            buffer->sync_address == vaddr && buffer->sync_size == size;
+	if (!already_synced) {
+		(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+		if (!is_written && !is_texel_buffer) {
+			// Record after the upload: it clears the CPU-dirty pages it found, and anything dirtied
+			// later bumps the generation again.
+			buffer->sync_generation = m_memory_tracker.CpuModifiedGeneration();
+			buffer->sync_address    = vaddr;
+			buffer->sync_size       = size;
+		} else {
+			buffer->sync_generation = 0;
+		}
+	}
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		RecordGpuWrite(vaddr, size, UnstampedTick);

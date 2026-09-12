@@ -73,6 +73,12 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The range last uploaded to this buffer, and the memory tracker's CPU-modified generation at
+	// the time. The same range asked for again at the same generation cannot have new CPU-written
+	// bytes, so its upload pass can be skipped. Zero means nothing has been recorded.
+	uint64_t sync_generation = 0;
+	uint64_t sync_address    = 0;
+	uint64_t sync_size       = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
