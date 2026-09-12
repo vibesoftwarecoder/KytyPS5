@@ -54,6 +54,15 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// Dispatch initiator bit meaning the counts are thread counts, not group counts. The recompiler
+// then takes them as shader inputs, so an indirect dispatch with this bit has to be read on the
+// CPU; without it the GPU reads the guest's arguments itself.
+inline constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
+
+[[nodiscard]] constexpr bool DispatchUsesThreadDimensions(uint32_t mode) {
+	return (mode & DispatchInitiatorUseThreadDimensions) != 0;
+}
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;

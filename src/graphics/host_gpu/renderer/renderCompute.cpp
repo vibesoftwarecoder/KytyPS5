@@ -309,7 +309,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
@@ -331,7 +330,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions = DispatchUsesThreadDimensions(mode);
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
