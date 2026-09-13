@@ -1179,8 +1179,16 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	// reading them here only forces a drain when a compute shader just wrote them. The values are
 	// needed on the CPU only for thread-dimension dispatches, whose counts become shader inputs.
 	// Each dispatch is traced (indirectArgsTrace.h) so a lost device shows what preceded it.
-	static const bool always_read = Common::LocalFeatureDisabled("dispatchargs");
-	const bool        skip        = !DispatchUsesThreadDimensions(mode) && !always_read;
+	//
+	// OFF BY DEFAULT. Skipping the read is worth ~0.7 fps but lost the GPU device on three of four
+	// loads (2026-09-12). All four losses logged an nvlddmkm timeout, and the drain counters show
+	// submissions were already being closed 15-42 times a second while it happened, so a whole
+	// submission was not running past the 2 s limit -- one dispatch was, which is what a garbage
+	// group count does. So the arguments the GPU reads are wrong at least sometimes, and the trace
+	// cannot say why: it records the cached buffer's guest base, not the memory the GPU read.
+	// Turn it on with KYTY_LOCAL_ENABLE=dispatchargs only to gather another crash dump.
+	static const bool skip_read = Common::LocalFeatureEnabled("dispatchargs");
+	const bool        skip      = !DispatchUsesThreadDimensions(mode) && skip_read;
 	IndirectArgsTrace::Begin(args_addr, 0, skip, m_submit_id);
 	if (skip) {
 		DispatchDirect(0, 0, 0, mode, args_addr);

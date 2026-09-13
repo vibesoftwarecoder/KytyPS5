@@ -1345,8 +1345,9 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		EXIT_NOT_IMPLEMENTED(args_addr == 0);
 		// As in CommandProcessor::DispatchIndirect: the GPU reads these arguments itself, so read
 		// them here only for thread-dimension dispatches, which consume the counts as shader inputs.
-		static const bool always_read = Common::LocalFeatureDisabled("dispatchargs");
-		const bool        skip        = !DispatchUsesThreadDimensions(mode) && !always_read;
+		// Off by default; see the comment in CommandProcessor::DispatchIndirect.
+		static const bool skip_read = Common::LocalFeatureEnabled("dispatchargs");
+		const bool        skip      = !DispatchUsesThreadDimensions(mode) && skip_read;
 		IndirectArgsTrace::Begin(args_addr, 1, skip, 0);
 		if (skip) {
 			cp.DispatchDirect(0, 0, 0, mode, args_addr);
