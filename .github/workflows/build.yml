@@ -407,9 +407,10 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      (github.repository == 'KytyPS5/KytyPS5' ||
+      ((github.repository == 'KytyPS5/KytyPS5' &&
+        github.event_name == 'push') ||
        (github.repository == 'vibesoftwarecoder/KytyPS5' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
         github.ref == 'refs/heads/demons-souls-performance')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
