@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, demons-souls-performance ]
   pull_request:
 
 env:
@@ -408,7 +408,9 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      (github.repository == 'KytyPS5/KytyPS5' ||
+       (github.repository == 'vibesoftwarecoder/KytyPS5' &&
+        github.ref == 'refs/heads/demons-souls-performance')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')

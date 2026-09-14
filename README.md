@@ -17,6 +17,17 @@ compatibility is limited and behavior may change significantly between builds.
 > not distribute games or copyrighted system software. Use only game files that you have obtained
 > legally.
 
+## Experimental Demon's Souls Performance Branch
+
+The `demons-souls-performance` branch combines the rendering and shader work from upstream pull
+request [#500](https://github.com/KytyPS5/KytyPS5/pull/500) with additional CPU, resource-table,
+buffer-cache, dispatch, pipeline-cache, and controller work. It is an experimental integration
+branch rather than an official KytyPS5 release. Performance varies by scene, hardware, game update,
+and driver; a stable 30 FPS is not guaranteed.
+
+Successful branch updates are packaged on the fork's
+[Releases page](https://github.com/vibesoftwarecoder/KytyPS5/releases).
+
 ## Current Status
 
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
